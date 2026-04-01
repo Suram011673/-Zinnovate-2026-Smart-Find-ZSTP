@@ -1,0 +1,6 @@
+# Optional: Donut DocVQA (heavy). Install after requirements.txt.
+# CPU torch (Windows): pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.0.0
+transformers>=4.40.0
+accelerate>=0.27.0
+sentencepiece>=0.2.0
