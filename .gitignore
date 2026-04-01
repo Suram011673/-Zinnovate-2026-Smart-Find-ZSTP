@@ -1,4 +1,4 @@
-# Python
+# --- Python ---
 .venv/
 venv/
 env/
@@ -9,21 +9,35 @@ __pycache__/
 .Python
 *.egg-info/
 .eggs/
-dist/
+*.egg
 build/
+# setuptools / wheel output (also avoids committing random "dist" folders)
+dist/
 
-# Node
+# --- Node ---
 node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+pnpm-debug.log*
 
-# Env / secrets
+# Vite production build — regenerate with: cd frontend && npm run build
+frontend/dist/
+
+# --- Env / secrets (never commit) ---
 .env
 .env.local
+.env.*.local
 *.pem
 
-# IDE / OS
+# --- Tooling / tests ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- IDE / OS ---
 .idea/
 .vscode/
 *.swp
