@@ -34,7 +34,7 @@ REM or: python -m venv .venv
 pip install -r requirements.txt
 # Optional GPU/CPU torch + Donut:
 # pip install -r requirements-ml.txt
-uvicorn main:app --reload --host 127.0.0.1 --port 8000
+python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ```
 
 ### Environment (optional AI)

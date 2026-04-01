@@ -152,11 +152,6 @@ export async function completeField(fieldId) {
   return data;
 }
 
-export async function resetState() {
-  const { data } = await api.post('/reset');
-  return data;
-}
-
 export async function seedMock() {
   const { data } = await api.post('/seed-mock');
   return data;
@@ -188,9 +183,7 @@ export async function uploadPdf(file, options = {}) {
   return postMultipart(`/upload-pdf?${q}`, fd);
 }
 
-/**
- * Upload one or more PDFs in one session. Optional checksText runs field verification on all.
- */
+/** Upload multiple PDFs in one session. */
 export async function uploadPdfBatch(fileList, options = {}, checksText = '', sessionContext = {}) {
   const {
     ocr = true,
@@ -224,37 +217,4 @@ export async function uploadPdfBatch(fileList, options = {}, checksText = '', se
   if (ctx.carrier) fd.append('carrier', String(ctx.carrier).slice(0, 200));
   if (ctx.vertical) fd.append('vertical', String(ctx.vertical).slice(0, 200));
   return postMultipart(`/upload-pdf-batch?${q}`, fd);
-}
-
-/**
- * Verify many PDFs against a dynamic list of concepts (one per line or JSON array).
- * Does not change the single-PDF session used by the viewer.
- */
-export async function batchVerifyFields(fileList, checksText, options = {}) {
-  const {
-    min_match_score = 62,
-    ocr = true,
-    aggressive_ocr = true,
-    handwriting_merge = false,
-    dynamic_fields = true,
-    use_openai = false,
-    use_gpt_validate = false,
-    use_transformers = false,
-  } = options;
-  const q = new URLSearchParams({
-    min_match_score: String(min_match_score),
-    ocr: String(ocr),
-    aggressive_ocr: String(aggressive_ocr),
-    handwriting_merge: String(handwriting_merge),
-    dynamic_fields: String(dynamic_fields),
-    use_openai: String(use_openai),
-    use_gpt_validate: String(use_gpt_validate),
-    use_transformers: String(use_transformers),
-  });
-  const fd = new FormData();
-  for (const f of fileList) {
-    fd.append('files', f, f.name || 'document.pdf');
-  }
-  fd.append('checks', checksText);
-  return postMultipart(`/batch-verify-fields?${q}`, fd);
 }

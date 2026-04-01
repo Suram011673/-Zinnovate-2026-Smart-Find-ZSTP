@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import PDFViewer from './components/PDFViewer.jsx';
 import * as api from './api.js';
 import { findTextInMultiplePdfs } from './utils/pdfTextSearch.js';
@@ -106,10 +106,46 @@ function bboxIou(a, b) {
   return inter / (aa + ba - inter + 1e-9);
 }
 
+/** Intersection area of two axis-aligned boxes (PDF space). */
+function bboxIntersectionArea(a, b) {
+  if (!a?.length || !b?.length) return 0;
+  const [ax0, ay0, ax1, ay1] = a;
+  const [bx0, by0, bx1, by1] = b;
+  const ix0 = Math.max(ax0, bx0);
+  const iy0 = Math.max(ay0, by0);
+  const ix1 = Math.min(ax1, bx1);
+  const iy1 = Math.min(ay1, by1);
+  return Math.max(0, ix1 - ix0) * Math.max(0, iy1 - iy0);
+}
+
+function bboxMinArea(a, b) {
+  const aa = Math.max(0, a[2] - a[0]) * Math.max(0, a[3] - a[1]);
+  const ba = Math.max(0, b[2] - b[0]) * Math.max(0, b[3] - b[1]);
+  return Math.min(aa, ba, Infinity);
+}
+
+/** Share of the smaller box covered by intersection — catches “word inside OCR line” with low IoU. */
+function bboxOverlapOfSmaller(a, b) {
+  if (!a?.length || !b?.length) return 0;
+  const inter = bboxIntersectionArea(a, b);
+  const small = bboxMinArea(a, b);
+  return small > 1e-6 ? inter / small : 0;
+}
+
+function normSearchSnippet(s) {
+  return (s || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase()
+    .slice(0, 96);
+}
+
 /** Embedded vs OCR often offset a few pt — IoU alone misses duplicates. */
 function bboxSameSearchLocation(a, b) {
   if (!a?.length || !b?.length) return false;
-  if (bboxIou(a, b) > 0.4) return true;
+  if (bboxIou(a, b) > 0.35) return true;
+  const ovSm = bboxOverlapOfSmaller(a, b);
+  if (ovSm > 0.52) return true;
   const [ax0, ay0, ax1, ay1] = a;
   const [bx0, by0, bx1, by1] = b;
   const acx = (ax0 + ax1) / 2;
@@ -124,6 +160,8 @@ function bboxSameSearchLocation(a, b) {
   const rW = aw > 1e-6 && bw > 1e-6 ? Math.min(aw, bw) / Math.max(aw, bw) : 0;
   const rH = ah > 1e-6 && bh > 1e-6 ? Math.min(ah, bh) / Math.max(ah, bh) : 0;
   if (dist < 22 && rW > 0.45 && rH > 0.45) return true;
+  if (dist < 38 && ovSm > 0.22 && rW > 0.2 && rH > 0.25) return true;
+  if (bboxIou(a, b) > 0.12 && dist < 28) return true;
   return false;
 }
 
@@ -143,13 +181,26 @@ function mergeAndDedupeSearchMatches(localTagged, serverMatches, orderIdx, rawQu
     return (a.bbox?.[1] || 0) - (b.bbox?.[1] || 0);
   });
   const out = [];
+  const qn = normSearchSnippet(rawQuery);
+  const snippetDedupeMinLen = Math.min(12, Math.max(4, (rawQuery || '').trim().length || 0));
   for (const m of merged) {
-    const dup = out.some(
-      (r) =>
-        r.document_id === m.document_id &&
-        r.page === m.page &&
-        bboxSameSearchLocation(r.bbox || [], m.bbox || []),
-    );
+    const dup = out.some((r) => {
+      if (r.document_id !== m.document_id || r.page !== m.page) return false;
+      const ra = r.bbox || [];
+      const ma = m.bbox || [];
+      if (bboxSameSearchLocation(ra, ma)) return true;
+      const nsr = normSearchSnippet(r.snippet);
+      const nsm = normSearchSnippet(m.snippet);
+      if (
+        qn.length >= 4 &&
+        nsr.length >= snippetDedupeMinLen &&
+        nsr === nsm &&
+        (bboxIou(ra, ma) > 0.08 || bboxOverlapOfSmaller(ra, ma) > 0.42)
+      ) {
+        return true;
+      }
+      return false;
+    });
     if (!dup) out.push(m);
   }
   return out;
@@ -165,28 +216,50 @@ export default function App() {
   const [searchText, setSearchText] = useState('');
   const [searchMatches, setSearchMatches] = useState([]);
   const [searchIndex, setSearchIndex] = useState(0);
-  const [searchHighlight, setSearchHighlight] = useState(null);
   const [searchBusy, setSearchBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadingText, setUploadingText] = useState('');
   const [readableDoc, setReadableDoc] = useState(null);
   const [transcriptBusy, setTranscriptBusy] = useState(false);
-  const [useDonut, setUseDonut] = useState(false);
-  const [useOpenAi, setUseOpenAi] = useState(false);
-  /** Strong OCR: extra EasyOCR on scanned pages (slower). Digital PDFs stay fast when off. */
-  const [handwritingMerge, setHandwritingMerge] = useState(false);
   const [documentsList, setDocumentsList] = useState([]);
   const [activeDocumentId, setActiveDocumentId] = useState(null);
   const [docFilesById, setDocFilesById] = useState({});
-  const [uploadVerifyText, setUploadVerifyText] = useState('');
   const [workflow, setWorkflow] = useState(null);
   const [reviewConfirmChecked, setReviewConfirmChecked] = useState(false);
-  const [lastVerifyReport, setLastVerifyReport] = useState(null);
   /** Last Find: how many session PDFs contain the keyword vs how many were searched */
   const [searchPdfStats, setSearchPdfStats] = useState(null);
-  const pendingSearchRef = useRef(null);
   const docFilesRef = useRef({});
   const activeDocRef = useRef(null);
+
+  /**
+   * PDF overlays are 100% data-driven: each Find uses the current `searchText` and merged API + embedded
+   * results in `searchMatches` — no fixed sample phrases. Every match on the active document gets a box;
+   * `searchIndex` only picks which box scrolls and shows the stronger “active” ring (Prev/Next).
+   */
+  const searchOverlayHits = useMemo(() => {
+    const q = searchText.trim();
+    if (!searchMatches.length || !q) return [];
+    let docFilter = activeDocumentId || '';
+    if (!docFilter) {
+      const ids = [...new Set(searchMatches.map((m) => m.document_id).filter(Boolean))];
+      if (ids.length === 1) docFilter = ids[0];
+      else return [];
+    }
+    return searchMatches
+      .map((m, globalIdx) => ({ m, globalIdx }))
+      .filter(({ m }) => (m.document_id || '') === docFilter)
+      .map(({ m, globalIdx }) => {
+        if (!m.page || !m.bbox || m.bbox.length < 4) return null;
+        const bbKey = (m.bbox || []).map((x) => Math.round(Number(x) * 10) / 10).join('-');
+        return {
+          page: m.page,
+          bbox: m.bbox,
+          overlayKey: `s-${docFilter}-${globalIdx}-p${m.page}-${bbKey}`,
+          scrollIntoView: globalIdx === searchIndex,
+        };
+      })
+      .filter(Boolean);
+  }, [searchMatches, activeDocumentId, searchIndex, searchText]);
 
   /** Field navigation/search remain locked until review is acknowledged. */
   const opsLocked = Boolean(workflow?.has_uploaded_pdfs && !workflow?.navigation_allowed);
@@ -201,26 +274,6 @@ export default function App() {
   /** Do not clear search when pdfFile changes for multi-PDF viewing (Find / Prev / Next). */
   useEffect(() => {
     if (!pdfFile) setReadableDoc(null);
-  }, [pdfFile]);
-
-  /** After switching the viewed File (e.g. search navigates to another PDF), apply pending highlight once the viewer loads. */
-  useEffect(() => {
-    const pending = pendingSearchRef.current;
-    if (!pending || !pdfFile) return;
-    pendingSearchRef.current = null;
-    const q = pending.query || '';
-    setSearchHighlight({
-      page: pending.page,
-      bbox: pending.bbox,
-      field_id: 'pdf_search',
-      name: 'Search',
-      label: 'Search',
-      value: q,
-      confidence: 1,
-      needs_review: false,
-      requires_verification: false,
-      isSearch: true,
-    });
   }, [pdfFile]);
 
   const refreshReadableText = useCallback(async () => {
@@ -268,9 +321,7 @@ export default function App() {
   const clearSearchResults = useCallback(() => {
     setSearchMatches([]);
     setSearchIndex(0);
-    setSearchHighlight(null);
     setSearchPdfStats(null);
-    pendingSearchRef.current = null;
   }, []);
 
   const clearSearchState = useCallback(() => {
@@ -294,23 +345,21 @@ export default function App() {
     setMsgErr(false);
     clearSearchState();
     setReadableDoc(null);
-    setLastVerifyReport(null);
     setReviewConfirmChecked(false);
     try {
       setOk('Uploading…');
       const options = {
         ocr: true,
-        use_openai: useOpenAi,
-        use_transformers: useDonut,
-        handwriting_merge: handwritingMerge,
+        use_openai: false,
+        use_transformers: false,
+        handwriting_merge: false,
       };
-      const canUseSingleFastPath =
-        files.length === 1 && !uploadVerifyText.trim();
-      const data = canUseSingleFastPath
-        ? await api.uploadPdf(files[0], options)
-        : await api.uploadPdfBatch(files, options, uploadVerifyText.trim(), {});
+      const data =
+        files.length === 1
+          ? await api.uploadPdf(files[0], options)
+          : await api.uploadPdfBatch(files, options, '', {});
       const map = {};
-      if (canUseSingleFastPath) {
+      if (files.length === 1) {
         const oneId = data.active_document_id || data.document_id;
         if (oneId) {
           map[oneId] = files[0];
@@ -330,9 +379,6 @@ export default function App() {
       setActiveDocumentId(data.active_document_id || null);
       const firstFile = map[data.active_document_id];
       setPdfFile(firstFile || null);
-      if (data.verification) {
-        setLastVerifyReport(data.verification);
-      }
       // Avoid blocking upload completion on transcript fetch.
       setReadableDoc(null);
       const n = data.documents?.length ?? 0;
@@ -352,45 +398,14 @@ export default function App() {
           `Ready: ${n} PDF(s) — viewing ${fn0}${failNote}. Check API errors for skipped files.`,
         );
       } else {
-        let line = `Ready: ${n} PDF(s) — viewing ${fn0}`;
-        if (data.verification?.all_messages?.length) {
-          line += ` · verify: ${data.verification.all_messages.length} line(s)`;
-        }
-        setOk(line);
+        setOk(`Ready: ${n} PDF(s) — viewing ${fn0}`);
       }
       await refreshWorkflow();
     } catch (err) {
-      setLastVerifyReport(null);
       setErr(formatApiError(err));
     } finally {
       setUploading(false);
       setUploadingText('');
-      setBusy(false);
-    }
-  };
-
-  const onReset = async () => {
-    setBusy(true);
-    clearSearchState();
-    try {
-      await api.resetState();
-      setPdfFile(null);
-      setDocFilesById({});
-      setDocumentsList([]);
-      setActiveDocumentId(null);
-      setLastVerifyReport(null);
-      setReadableDoc(null);
-      setWorkflow(null);
-      setReviewConfirmChecked(false);
-      try {
-        await refreshWorkflow();
-      } catch {
-        /* session empty */
-      }
-      setOk('Reset.');
-    } catch (e) {
-      setErr(formatApiError(e));
-    } finally {
       setBusy(false);
     }
   };
@@ -414,22 +429,9 @@ export default function App() {
           setActiveDocumentId(m.document_id);
           setPdfFile(f);
           await refreshFields();
-          pendingSearchRef.current = { page: m.page, bbox: m.bbox, query: q };
           return;
         }
       }
-      setSearchHighlight({
-        page: m.page,
-        bbox: m.bbox,
-        field_id: 'pdf_search',
-        name: 'Search',
-        label: 'Search',
-        value: q,
-        confidence: 1,
-        needs_review: false,
-        requires_verification: false,
-        isSearch: true,
-      });
     },
     [refreshFields],
   );
@@ -468,7 +470,6 @@ export default function App() {
       try {
         serverMatches = await api.documentSearch(q);
       } catch (se) {
-        setSearchHighlight(null);
         setSearchPdfStats(null);
         setErr(formatApiError(se));
         return;
@@ -491,7 +492,6 @@ export default function App() {
         matchCount: merged.length,
       });
       if (!merged.length) {
-        setSearchHighlight(null);
         setErr(
           pdfTotal > 1
             ? `No matches — 0 of ${pdfTotal} PDFs contain “${q}” (embedded text + OCR). Try a shorter word or different spelling.`
@@ -562,8 +562,6 @@ export default function App() {
           await applySearchMatch(matches, idx, q);
           setOk(`Viewing: ${f.name} · match ${idx + 1} of ${matches.length} for “${q}”`);
         } else {
-          setSearchHighlight(null);
-          pendingSearchRef.current = null;
           setOk(
             `Viewing: ${f.name} — no matches for “${q}” in this file. Use Prev/Next to move across PDFs.`,
           );
@@ -614,7 +612,7 @@ export default function App() {
           <p className="app-header-eyebrow">Zinnia workflow</p>
           <h1>Smart PDF Navigator</h1>
           <p className="app-header-tagline">
-            Jump to each field on the PDF, validate batches on upload, search across files — less manual scrolling.
+            Jump to each field on the PDF and search across files — less manual scrolling.
           </p>
         </div>
       </header>
@@ -649,8 +647,8 @@ export default function App() {
                   <strong>EasyOCR</strong> (deep learning) improves lines and handwriting when enabled.
                 </li>
                 <li>
-                  <strong>Handwriting</strong> — Use <strong>Strong OCR</strong> under Advanced extraction and/or server{' '}
-                  <code>SMART_FIND_HANDWRITING_MODE=1</code> for harder cursive (slower).
+                  <strong>Handwriting</strong> — Server <code>SMART_FIND_HANDWRITING_MODE=1</code> enables stronger OCR for
+                  harder cursive (slower).
                 </li>
                 <li>
                   <strong>NLP / structuring</strong> — Detected fields come from layout + text; optional <strong>OpenAI</strong>{' '}
@@ -685,86 +683,6 @@ export default function App() {
                   ))}
                 </select>
               </label>
-            )}
-
-            <div className="validate-once-block">
-              <h3 className="validate-once-block__title">Validate on upload</h3>
-              <p className="field-hint muted small">
-                One concept per line — checked when you upload (empty = skip). Results appear under{' '}
-                <strong>Validation</strong> below.
-              </p>
-              <textarea
-                className="search-input batch-checks-input"
-                rows={3}
-                aria-label="Concepts to validate on every PDF when you upload"
-                placeholder={'Date of birth\nPolicy number'}
-                value={uploadVerifyText}
-                disabled={busy}
-                onChange={(e) => setUploadVerifyText(e.target.value)}
-                spellCheck={false}
-              />
-            </div>
-            <details className="panel-advanced muted small">
-              <summary>Advanced extraction</summary>
-              <p className="field-hint muted small" style={{ marginTop: 0 }}>
-                Uploads are much faster for normal PDFs: only <em>scanned</em> pages run full raster OCR. Enable{' '}
-                <strong>Strong OCR</strong> for hard scans or cursive. For ink on top of typed forms server-wide, set{' '}
-                <code className="small">SMART_FIND_MIXED_PAGE_OCR=1</code> (slow).
-              </p>
-              <label className="checkbox-row">
-                <input
-                  type="checkbox"
-                  checked={useOpenAi}
-                  disabled={busy}
-                  onChange={(e) => setUseOpenAi(e.target.checked)}
-                />
-                <span>OpenAI (needs API key)</span>
-              </label>
-              <label className="checkbox-row">
-                <input
-                  type="checkbox"
-                  checked={handwritingMerge}
-                  disabled={busy}
-                  onChange={(e) => setHandwritingMerge(e.target.checked)}
-                />
-                <span>Strong OCR (scans, handwriting, mixed pages)</span>
-              </label>
-              <label className="checkbox-row">
-                <input
-                  type="checkbox"
-                  checked={useDonut}
-                  disabled={busy}
-                  onChange={(e) => setUseDonut(e.target.checked)}
-                />
-                <span>Donut (page 1, ML deps)</span>
-              </label>
-            </details>
-            <button type="button" className="btn-secondary btn-full" disabled={busy} onClick={onReset}>
-              Reset all
-            </button>
-            {lastVerifyReport?.summary && (
-              <div className="verify-results" id="validation-report" style={{ marginTop: 10 }}>
-                <p className="muted small" style={{ marginBottom: 6 }}>
-                  <strong>Validation</strong> — {Number(lastVerifyReport.summary.pdf_count) || 0} PDF(s),{' '}
-                  {Number(lastVerifyReport.summary.concepts_count) || 0} concept(s).{' '}
-                  {Number(lastVerifyReport.summary.pdfs_all_ok) ===
-                  Number(lastVerifyReport.summary.pdf_count) ? (
-                    <span>All PDFs passed.</span>
-                  ) : (
-                    <span>
-                      {Number(lastVerifyReport.summary.pdfs_with_issues) || 0} PDF(s) with missing/unmatched
-                      fields.
-                    </span>
-                  )}
-                </p>
-                {Array.isArray(lastVerifyReport.all_messages) && lastVerifyReport.all_messages.length > 0 ? (
-                  <pre className="nav-log batch-output">
-                    {lastVerifyReport.all_messages.filter(Boolean).join('\n')}
-                  </pre>
-                ) : (
-                  <p className="muted small">No issue lines — all listed concepts satisfied.</p>
-                )}
-              </div>
             )}
           </section>
 
@@ -826,11 +744,14 @@ export default function App() {
 
           <section className="panel panel--search">
             <h2>Search</h2>
-            <p className="field-hint muted small">All session PDFs · Prev/Next through matches.</p>
+            <p className="field-hint muted small">
+              Type any word, number, or phrase — Find runs on that text only. All hits on the open PDF highlight
+              together; Prev/Next moves focus (accent + scroll).
+            </p>
             <input
               type="text"
               className="search-input"
-              placeholder="Type text to find…"
+              placeholder="Search words, numbers, or phrases…"
               value={searchText}
               disabled={
                 opsLocked || searchBusy || (!documentsList.length && !pdfFile)
@@ -839,7 +760,7 @@ export default function App() {
               onKeyDown={(e) => {
                 if (e.key === 'Enter') onSearchPdf();
               }}
-              aria-label="Search text in PDF"
+              aria-label="Search PDFs using your own keywords or numbers"
             />
             <div className="btn-row search-actions">
               <button
@@ -874,7 +795,7 @@ export default function App() {
               <button
                 type="button"
                 className="btn-secondary"
-                disabled={opsLocked || !searchHighlight}
+                disabled={opsLocked || !searchMatches.length}
                 onClick={onClearSearch}
               >
                 Clear
@@ -906,14 +827,18 @@ export default function App() {
             )}
           </section>
 
-          {msg && (
-            <p className={`app-msg${msgErr ? ' app-msg--err' : ''}`}>{msg}</p>
-          )}
+          <div className="app-sidebar-trailing">
+            {msg ? (
+              <p className={`app-msg${msgErr ? ' app-msg--err' : ''}`} role="status">
+                {msg}
+              </p>
+            ) : null}
 
-          <details className="panel panel--log panel--collapsible">
-            <summary>Activity log</summary>
-            <pre className="nav-log">{log.slice(-12).join('\n')}</pre>
-          </details>
+            <details className="panel panel--log panel--collapsible">
+              <summary>Activity log</summary>
+              <pre className="nav-log">{log.length ? log.slice(-12).join('\n') : 'No navigation events yet.'}</pre>
+            </details>
+          </div>
         </aside>
 
         <main className="app-main">
@@ -951,7 +876,8 @@ export default function App() {
                 key={activeDocumentId || 'none'}
                 ref={pdfViewerRef}
                 file={pdfFile}
-                highlight={searchHighlight}
+                highlight={null}
+                searchHits={searchOverlayHits}
               />
             </div>
           </div>

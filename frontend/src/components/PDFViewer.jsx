@@ -27,44 +27,106 @@ function highlightPropsEqual(a, b) {
   return ba[0] === bb[0] && ba[1] === bb[1] && ba[2] === bb[2] && ba[3] === bb[3];
 }
 
+function bboxEqual4(a, b) {
+  if (!a?.length || !b?.length || a.length < 4 || b.length < 4) return false;
+  return a[0] === b[0] && a[1] === b[1] && a[2] === b[2] && a[3] === b[3];
+}
+
+function searchHitsForPageEqual(prev, next) {
+  if (prev === next) return true;
+  if (!prev?.length && !next?.length) return true;
+  if (!prev || !next || prev.length !== next.length) return false;
+  for (let i = 0; i < prev.length; i += 1) {
+    if (prev[i].scrollIntoView !== next[i].scrollIntoView) return false;
+    if (!bboxEqual4(prev[i].bbox, next[i].bbox)) return false;
+  }
+  return true;
+}
+
 function pageCanvasPropsEqual(prev, next) {
   return (
     prev.pdf === next.pdf &&
     prev.pageNumber === next.pageNumber &&
     prev.maxPageCssPx === next.maxPageCssPx &&
     prev.scrollTargetsRef === next.scrollTargetsRef &&
-    highlightPropsEqual(prev.highlight, next.highlight)
+    highlightPropsEqual(prev.highlight, next.highlight) &&
+    searchHitsForPageEqual(prev.searchHits, next.searchHits)
   );
 }
 
-function PageCanvasInner({ pdf, pageNumber, scrollTargetsRef, highlight, maxPageCssPx }) {
-  const wrapRef = useRef(null);
-  const canvasRef = useRef(null);
-  const renderTaskRef = useRef(null);
-  const renderRetryRef = useRef(0);
-  const [viewportSize, setViewportSize] = useState({ w: 0, h: 0 });
-  const [renderNonce, setRenderNonce] = useState(0);
+/**
+ * Canvas + PDF.js render only. Memoized so Find overlays / scroll do not re-run this subtree
+ * and cancel in-flight page.render (blank pages).
+ */
+const PdfPageCanvasCore = memo(
+  function PdfPageCanvasCore({ pdf, pageNumber, maxPageCssPx, onMetrics }) {
+    const canvasRef = useRef(null);
+    const renderTaskRef = useRef(null);
+    const renderRetryRef = useRef(0);
+    const [viewportSize, setViewportSize] = useState({ w: 0, h: 0 });
+    const [canvasLayoutW, setCanvasLayoutW] = useState(0);
+    const [renderNonce, setRenderNonce] = useState(0);
 
-  useEffect(() => {
-    renderRetryRef.current = 0;
-    setRenderNonce(0);
-  }, [pdf, pageNumber, maxPageCssPx]);
+    useEffect(() => {
+      renderRetryRef.current = 0;
+      setRenderNonce(0);
+    }, [pdf, pageNumber, maxPageCssPx]);
 
-  useEffect(() => {
-    let cancelled = false;
-    let retryTimer = null;
-    (async () => {
-      try {
-        const page = await pdf.getPage(pageNumber);
-        if (cancelled) return;
-        const base = page.getViewport({ scale: 1 });
-        const cap = Math.max(280, Number(maxPageCssPx) || 920);
-        const scale = Math.min(1.4, cap / base.width);
-        const viewport = page.getViewport({ scale });
-        const canvas = canvasRef.current;
-        if (!canvas) return;
-        const ctx = canvas.getContext('2d', { alpha: false });
-        if (!ctx) return;
+    useEffect(() => {
+      let cancelled = false;
+      let retryTimer = null;
+      (async () => {
+        try {
+          const page = await pdf.getPage(pageNumber);
+          if (cancelled) return;
+          const base = page.getViewport({ scale: 1 });
+          const cap = Math.max(280, Number(maxPageCssPx) || 920);
+          const scale = Math.min(1.4, cap / base.width);
+          const viewport = page.getViewport({ scale });
+          const canvas = canvasRef.current;
+          if (!canvas) return;
+          const ctx = canvas.getContext('2d', { alpha: false });
+          if (!ctx) return;
+          if (renderTaskRef.current) {
+            try {
+              renderTaskRef.current.cancel();
+            } catch {
+              /* ignore */
+            }
+            renderTaskRef.current = null;
+          }
+          canvas.width = viewport.width;
+          canvas.height = viewport.height;
+          setViewportSize({ w: viewport.width, h: viewport.height });
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(0, 0, viewport.width, viewport.height);
+
+          const task = page.render({
+            canvasContext: ctx,
+            viewport,
+            intent: 'display',
+            background: 'rgb(255,255,255)',
+          });
+          renderTaskRef.current = task;
+          await task.promise;
+          renderRetryRef.current = 0;
+        } catch (e) {
+          const name = e && typeof e === 'object' ? e.name : '';
+          if (!cancelled && renderRetryRef.current < 3) {
+            renderRetryRef.current += 1;
+            retryTimer = setTimeout(() => setRenderNonce((n) => n + 1), 120);
+            return;
+          }
+          if (name !== 'RenderingCancelledException') {
+            setViewportSize({ w: 0, h: 0 });
+          }
+        } finally {
+          renderTaskRef.current = null;
+        }
+      })();
+      return () => {
+        cancelled = true;
+        if (retryTimer) clearTimeout(retryTimer);
         if (renderTaskRef.current) {
           try {
             renderTaskRef.current.cancel();
@@ -73,48 +135,48 @@ function PageCanvasInner({ pdf, pageNumber, scrollTargetsRef, highlight, maxPage
           }
           renderTaskRef.current = null;
         }
-        canvas.width = viewport.width;
-        canvas.height = viewport.height;
-        setViewportSize({ w: viewport.width, h: viewport.height });
-        ctx.fillStyle = '#ffffff';
-        ctx.fillRect(0, 0, viewport.width, viewport.height);
+      };
+    }, [pdf, pageNumber, maxPageCssPx, renderNonce]);
 
-        const task = page.render({
-          canvasContext: ctx,
-          viewport,
-          intent: 'display',
-          background: 'rgb(255,255,255)',
-        });
-        renderTaskRef.current = task;
-        await task.promise;
-        renderRetryRef.current = 0;
-      } catch (e) {
-        const name = e && typeof e === 'object' ? e.name : '';
-        if (!cancelled && renderRetryRef.current < 2) {
-          renderRetryRef.current += 1;
-          retryTimer = setTimeout(() => setRenderNonce((n) => n + 1), 80);
-          return;
-        }
-        if (name !== 'RenderingCancelledException') {
-          setViewportSize({ w: 0, h: 0 });
-        }
-      } finally {
-        renderTaskRef.current = null;
-      }
-    })();
-    return () => {
-      cancelled = true;
-      if (retryTimer) clearTimeout(retryTimer);
-      if (renderTaskRef.current) {
-        try {
-          renderTaskRef.current.cancel();
-        } catch {
-          /* ignore */
-        }
-        renderTaskRef.current = null;
-      }
-    };
-  }, [pdf, pageNumber, maxPageCssPx, renderNonce]);
+    useLayoutEffect(() => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const sync = () => {
+        const w = canvas.getBoundingClientRect().width;
+        if (w > 0) setCanvasLayoutW(w);
+      };
+      sync();
+      const ro = new ResizeObserver(() => sync());
+      ro.observe(canvas);
+      return () => ro.disconnect();
+    }, [pdf, pageNumber, maxPageCssPx, renderNonce, viewportSize.w]);
+
+    useEffect(() => {
+      const layoutW = canvasLayoutW > 0 ? canvasLayoutW : viewportSize.w;
+      onMetrics(viewportSize.w, layoutW);
+    }, [onMetrics, viewportSize.w, canvasLayoutW]);
+
+    return <canvas ref={canvasRef} />;
+  },
+  (prev, next) =>
+    prev.pdf === next.pdf &&
+    prev.pageNumber === next.pageNumber &&
+    prev.maxPageCssPx === next.maxPageCssPx,
+);
+
+function PageCanvasInner({ pdf, pageNumber, scrollTargetsRef, highlight, searchHits, maxPageCssPx }) {
+  const wrapRef = useRef(null);
+  const [metrics, setMetrics] = useState({ canvasW: 0, layoutW: 0 });
+  const onMetrics = useCallback((canvasW, layoutW) => {
+    setMetrics((prev) => {
+      if (prev.canvasW === canvasW && prev.layoutW === layoutW) return prev;
+      return { canvasW, layoutW };
+    });
+  }, []);
+
+  const highlightCanvasW =
+    metrics.layoutW > 0 ? metrics.layoutW : metrics.canvasW > 0 ? metrics.canvasW : 0;
+  const canvasPainted = metrics.canvasW > 0;
 
   return (
     <div
@@ -129,17 +191,39 @@ function PageCanvasInner({ pdf, pageNumber, scrollTargetsRef, highlight, maxPage
     >
       <span className="pdf-page-label">Page {pageNumber}</span>
       <div className="pdf-page-inner">
-        <canvas ref={canvasRef} />
-        {highlight?.bbox && viewportSize.w > 0 && (
+        <PdfPageCanvasCore
+          pdf={pdf}
+          pageNumber={pageNumber}
+          maxPageCssPx={maxPageCssPx}
+          onMetrics={onMetrics}
+        />
+        {highlight?.bbox && highlightCanvasW > 0 && (
           <HighlightOverlay
             bbox={highlight.bbox}
-            canvasW={viewportSize.w}
+            canvasW={highlightCanvasW}
             pdf={pdf}
             pageNumber={pageNumber}
             needsReview={highlight.needs_review}
             requiresVerification={highlight.requires_verification}
             variant={highlight.isSearch ? 'search' : 'field'}
           />
+        )}
+        {(searchHits || []).map((hit) =>
+          hit.bbox && highlightCanvasW > 0 ? (
+            <HighlightOverlay
+              key={hit.overlayKey}
+              bbox={hit.bbox}
+              canvasW={highlightCanvasW}
+              pdf={pdf}
+              pageNumber={pageNumber}
+              needsReview={false}
+              requiresVerification={false}
+              variant="search"
+              scrollIntoView={Boolean(hit.scrollIntoView)}
+              searchActive={Boolean(hit.scrollIntoView)}
+              deferScrollUntilPainted={canvasPainted}
+            />
+          ) : null,
         )}
       </div>
     </div>
@@ -150,9 +234,9 @@ const PageCanvas = memo(PageCanvasInner, pageCanvasPropsEqual);
 
 /**
  * Renders PDF from File; scrolls to highlight.page; draws bbox overlay (PDF points → canvas scale).
- * ref.findMatches(query) → Promise<matches[]> for full-document text search (embedded text layer).
+ * ref.findMatches(query) → Promise<matches[]> for full-document text layer search.
  */
-const PDFViewer = forwardRef(function PDFViewer({ file, highlight }, ref) {
+const PDFViewer = forwardRef(function PDFViewer({ file, highlight, searchHits = [] }, ref) {
   const containerRef = useRef(null);
   const pageRefs = useRef({});
   const loadingTaskRef = useRef(null);
@@ -173,10 +257,10 @@ const PDFViewer = forwardRef(function PDFViewer({ file, highlight }, ref) {
     const w = el.clientWidth;
     if (w <= 0) return;
     const raw = Math.max(280, w - 8);
-    /* 64px buckets: scrollbar show/hide (~15px) rarely changes bucket → fewer render cancellations */
-    const next = Math.round(raw / 64) * 64;
+    /* Wider buckets → fewer width flips when Find scroll shows/hides scrollbars (avoids blank pages). */
+    const next = Math.round(raw / 128) * 128;
     const prev = lastLayoutWidthRef.current;
-    if (prev > 0 && Math.abs(next - prev) < 64) return;
+    if (prev > 0 && Math.abs(next - prev) < 128) return;
     lastLayoutWidthRef.current = next;
     setMaxPageCssPx(next);
   }, []);
@@ -186,7 +270,7 @@ const PDFViewer = forwardRef(function PDFViewer({ file, highlight }, ref) {
     resizeDebounceRef.current = setTimeout(() => {
       resizeDebounceRef.current = null;
       measureMaxWidth();
-    }, 200);
+    }, 280);
   }, [measureMaxWidth]);
 
   useLayoutEffect(() => {
@@ -320,6 +404,7 @@ const PDFViewer = forwardRef(function PDFViewer({ file, highlight }, ref) {
           maxPageCssPx={maxPageCssPx}
           scrollTargetsRef={pageRefs}
           highlight={highlight?.page === i + 1 ? highlight : null}
+          searchHits={(searchHits || []).filter((h) => h.page === i + 1)}
         />
       ))}
     </div>

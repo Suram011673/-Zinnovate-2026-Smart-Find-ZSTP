@@ -47,4 +47,4 @@ set "CHECK_PORT="
 
 call .venv\Scripts\activate.bat
 echo Starting uvicorn on http://%SMART_FIND_API_HOST%:%SMART_FIND_API_PORT%  (OCR: /health/ocr )
-uvicorn main:app --reload --host %SMART_FIND_API_HOST% --port %SMART_FIND_API_PORT%
+python -m uvicorn main:app --reload --host %SMART_FIND_API_HOST% --port %SMART_FIND_API_PORT%

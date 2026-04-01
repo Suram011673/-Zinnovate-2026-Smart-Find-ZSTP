@@ -32,9 +32,32 @@ function subStringBBox(item, startIdx, endIdx, viewport, opts = {}) {
   let x1 = Math.max(xL, xR);
   let y1 = Math.max(yTop, yBot);
   const ah = Math.abs(hScale);
-  /* Tight search: tiny floor only when bbox collapses; avoid full-line-height padding */
-  const minW = tight ? Math.max(1, ah * 0.02) : Math.max(2, ah * 0.08);
-  const minH = tight ? Math.max(1, ah * 0.18) : Math.max(2, ah * 0.85);
+  const spanLen = Math.max(0, endIdx - startIdx);
+
+  /*
+   * Many PDFs set TextItem.width to the full line or column advance while str is only a short word
+   * (e.g. heading "Solution"). Uniform char-fraction then paints a highlight across the whole line.
+   * Clamp using typical em-width per glyph when the implied advance is implausible.
+   */
+  if (tight && spanLen >= 1 && spanLen <= 160) {
+    const rawW = Math.abs(x1 - x0);
+    const em = ah || Math.abs(wScale) || 1;
+    const estGlyphW = em * 0.58;
+    const capW = estGlyphW * spanLen * 1.1;
+    const impliedPerChar = rawW / spanLen;
+    const nearFullRun = spanLen >= n - 1;
+    const implausiblyWideGlyph = impliedPerChar > em * 0.88;
+    if (rawW > capW * 1.32 && (nearFullRun || implausiblyWideGlyph)) {
+      const left = Math.min(x0, x1);
+      const newW = Math.min(rawW, capW);
+      x0 = left;
+      x1 = left + newW;
+    }
+  }
+
+  /* Tight search: minimal floors so the box tracks the query, not extra line padding */
+  const minW = tight ? Math.max(0.5, ah * 0.015) : Math.max(2, ah * 0.08);
+  const minH = tight ? Math.max(0.5, ah * 0.1) : Math.max(2, ah * 0.85);
   if (x1 - x0 < minW) {
     const mid = (x0 + x1) / 2;
     x0 = mid - minW / 2;
@@ -82,9 +105,10 @@ function isWordChar(ch) {
 }
 
 /**
- * Indices where qLower appears as a whole word (Unicode-aware boundaries).
+ * Indices where qLower appears as a complete keyword or phrase (Unicode-aware word boundaries).
+ * Does not match a substring inside a longer word (e.g. "cat" in "catch").
  */
-function wholeWordIndices(fullLow, qLower) {
+function phraseBoundaryIndices(fullLow, qLower) {
   const out = [];
   if (!qLower.length || !fullLow.includes(qLower)) return out;
   let pos = 0;
@@ -93,18 +117,56 @@ function wholeWordIndices(fullLow, qLower) {
     if (idx < 0) break;
     const before = idx === 0 ? '' : fullLow[idx - 1];
     const after = idx + qLower.length >= fullLow.length ? '' : fullLow[idx + qLower.length];
-    const okBefore = !isWordChar(before);
-    const okAfter = !isWordChar(after);
-    if (okBefore && okAfter) out.push(idx);
+    if (!isWordChar(before) && !isWordChar(after)) out.push(idx);
     pos = idx + 1;
   }
   return out;
 }
 
+function levenshtein(a, b) {
+  const m = a.length;
+  const n = b.length;
+  if (!m) return n;
+  if (!n) return m;
+  const dp = new Array(n + 1);
+  for (let j = 0; j <= n; j += 1) dp[j] = j;
+  for (let i = 1; i <= m; i += 1) {
+    let prev = dp[0];
+    dp[0] = i;
+    for (let j = 1; j <= n; j += 1) {
+      const cur = dp[j];
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[j] = Math.min(dp[j] + 1, dp[j - 1] + 1, prev + cost);
+      prev = cur;
+    }
+  }
+  return dp[n];
+}
+
+/** 0–100 similarity for typo-tolerant fallback (whole token vs keyword). */
+function keywordSimilarityRatio(a, b) {
+  const al = (a || '').toLowerCase();
+  const bl = (b || '').toLowerCase();
+  if (al === bl) return 100;
+  const d = levenshtein(al, bl);
+  return Math.round(100 * (1 - d / Math.max(al.length, bl.length, 1)));
+}
+
+function fuzzyRatioThreshold(qLen) {
+  if (qLen <= 3) return 88;
+  if (qLen <= 6) return 82;
+  return 86;
+}
+
+function maxLenDeltaForFuzzy(qLen) {
+  return Math.max(2, Math.floor(qLen / 2) + 1);
+}
+
 /**
  * Group text items into rough reading-order lines (same baseline band), merge text, search.
  */
-function findInPageLines(items, pageNum, viewport, qLower, useWholeWord) {
+/** Merged-line search: full keyword/phrase with word boundaries only. */
+function findInPageLinesBoundary(items, pageNum, viewport, qLower) {
   const matches = [];
   const textItems = items.filter((it) => 'str' in it && it.str && it.str.trim());
   if (!textItems.length) return matches;
@@ -164,21 +226,11 @@ function findInPageLines(items, pageNum, viewport, qLower, useWholeWord) {
       if (!boxes.length) return;
       const bbox = unionBBox(boxes);
       const sn = full.slice(Math.max(0, idx - 12), idx + len + 12);
-      matches.push({ page: pageNum, bbox, snippet: sn });
+      matches.push({ page: pageNum, bbox, snippet: sn, match_type: 'exact' });
     };
 
-    if (useWholeWord) {
-      for (const idx of wholeWordIndices(fullLow, qLower)) {
-        recordMatch(idx, qLower.length);
-      }
-    } else {
-      let from = 0;
-      while (from < fullLow.length) {
-        const idx = fullLow.indexOf(qLower, from);
-        if (idx < 0) break;
-        recordMatch(idx, qLower.length);
-        from = idx + 1;
-      }
+    for (const idx of phraseBoundaryIndices(fullLow, qLower)) {
+      recordMatch(idx, qLower.length);
     }
   }
 
@@ -187,19 +239,101 @@ function findInPageLines(items, pageNum, viewport, qLower, useWholeWord) {
 
 function bboxDedupeKey(page, bbox) {
   if (!bbox || bbox.length < 4) return `${page}|`;
-  const q = bbox.map((x) => Math.round(Number(x)));
+  const q = bbox.map((x) => Math.round(Number(x) / 4));
   return `${page}|${q.join(',')}`;
 }
 
+function bboxIouEmbedded(a, b) {
+  if (!a?.length || !b?.length) return 0;
+  const [ax0, ay0, ax1, ay1] = a;
+  const [bx0, by0, bx1, by1] = b;
+  const ix0 = Math.max(ax0, bx0);
+  const iy0 = Math.max(ay0, by0);
+  const ix1 = Math.min(ax1, bx1);
+  const iy1 = Math.min(ay1, by1);
+  const iw = Math.max(0, ix1 - ix0);
+  const ih = Math.max(0, iy1 - iy0);
+  const inter = iw * ih;
+  if (inter <= 0) return 0;
+  const aa = Math.max(0, ax1 - ax0) * Math.max(0, ay1 - ay0);
+  const ba = Math.max(0, bx1 - bx0) * Math.max(0, by1 - by0);
+  return inter / (aa + ba - inter + 1e-9);
+}
+
+function bboxIntersectionAreaEmbedded(a, b) {
+  if (!a?.length || !b?.length) return 0;
+  const [ax0, ay0, ax1, ay1] = a;
+  const [bx0, by0, bx1, by1] = b;
+  const ix0 = Math.max(ax0, bx0);
+  const iy0 = Math.max(ay0, by0);
+  const ix1 = Math.min(ax1, bx1);
+  const iy1 = Math.min(ay1, by1);
+  return Math.max(0, ix1 - ix0) * Math.max(0, iy1 - iy0);
+}
+
+function bboxOverlapOfSmallerEmbedded(a, b) {
+  if (!a?.length || !b?.length) return 0;
+  const inter = bboxIntersectionAreaEmbedded(a, b);
+  const aa = Math.max(0, a[2] - a[0]) * Math.max(0, a[3] - a[1]);
+  const ba = Math.max(0, b[2] - b[0]) * Math.max(0, b[3] - b[1]);
+  const small = Math.min(aa, ba);
+  return small > 1e-6 ? inter / small : 0;
+}
+
+/** Same reading location: tight box vs merged line, or split text items. */
+function bboxSameEmbeddedHit(a, b) {
+  if (!a?.length || !b?.length) return false;
+  if (bboxIouEmbedded(a, b) > 0.32) return true;
+  const ov = bboxOverlapOfSmallerEmbedded(a, b);
+  if (ov > 0.5) return true;
+  const acx = (a[0] + a[2]) / 2;
+  const acy = (a[1] + a[3]) / 2;
+  const bcx = (b[0] + b[2]) / 2;
+  const bcy = (b[1] + b[3]) / 2;
+  const dist = Math.hypot(acx - bcx, acy - bcy);
+  const aw = Math.max(0, a[2] - a[0]);
+  const ah = Math.max(0, a[3] - a[1]);
+  const bw = Math.max(0, b[2] - b[0]);
+  const bh = Math.max(0, b[3] - b[1]);
+  const rW = aw > 1e-6 && bw > 1e-6 ? Math.min(aw, bw) / Math.max(aw, bw) : 0;
+  const rH = ah > 1e-6 && bh > 1e-6 ? Math.min(ah, bh) / Math.max(ah, bh) : 0;
+  if (dist < 20 && rW > 0.4 && rH > 0.4) return true;
+  if (dist < 32 && ov > 0.2 && rW > 0.18 && rH > 0.22) return true;
+  if (bboxIouEmbedded(a, b) > 0.1 && dist < 24) return true;
+  return false;
+}
+
+/**
+ * After collecting hits on one page, drop geometry duplicates (keep tighter boxes first).
+ */
+function dedupeEmbeddedHitsOnPage(hits) {
+  if (hits.length < 2) return hits;
+  const area = (h) => {
+    const b = h.bbox;
+    if (!b || b.length < 4) return Infinity;
+    const w = Math.abs(b[2] - b[0]);
+    const hgt = Math.abs(b[3] - b[1]);
+    const a = w * hgt;
+    return Number.isFinite(a) && a > 0 ? a : Infinity;
+  };
+  const sorted = [...hits].sort((x, y) => area(x) - area(y));
+  const out = [];
+  for (const h of sorted) {
+    if (out.some((k) => bboxSameEmbeddedHit(k.bbox, h.bbox))) continue;
+    out.push(h);
+  }
+  return out;
+}
+
 function pushHitUnique(hit, matches, seen) {
-  const k = `${bboxDedupeKey(hit.page, hit.bbox)}|${(hit.snippet || '').slice(0, 48)}`;
+  const k = `${bboxDedupeKey(hit.page, hit.bbox)}|${(hit.snippet || '').replace(/\s+/g, ' ').trim().slice(0, 48).toLowerCase()}`;
   if (seen.has(k)) return;
   seen.add(k);
   matches.push(hit);
 }
 
 /** Min digit count (after stripping non-digits from query) to run flexible embedded-number match. */
-const MIN_DIGIT_QUERY_LEN = 4;
+const MIN_DIGIT_QUERY_LEN = 3;
 
 /** Unicode-aware strip to digit characters only (query may include any separators). */
 function digitsOnly(s) {
@@ -312,87 +446,97 @@ function collectDigitFormattedItemMatches(items, pageNum, viewport, flexRe, seen
   }
 }
 
-/** Substring search inside each raw text item (handles glued tokens, odd splits). */
-function collectItemSubstringMatches(items, pageNum, viewport, qLower, seen, matches) {
+/** Per text item: boundary-only matches (handles odd PDF splits where line merge missed). */
+function collectItemBoundaryMatches(items, pageNum, viewport, qLower, seen, matches) {
   for (const item of items) {
     if (!('str' in item) || !item.str) continue;
     const low = item.str.toLowerCase();
-    let from = 0;
-    while (from < low.length) {
-      const idx = low.indexOf(qLower, from);
-      if (idx < 0) break;
+    for (const idx of phraseBoundaryIndices(low, qLower)) {
       const bbox = subStringBBox(item, idx, idx + qLower.length, viewport, { tight: true });
       const sn = item.str.slice(Math.max(0, idx - 12), idx + qLower.length + 12);
-      pushHitUnique({ page: pageNum, bbox, snippet: sn }, matches, seen);
-      from = idx + 1;
+      pushHitUnique({ page: pageNum, bbox, snippet: sn, match_type: 'exact' }, matches, seen);
     }
   }
 }
 
 /**
- * Search embedded PDF text on all pages (selectable / digital text layer).
- * Prefers whole-word matches for long queries, then falls back to substring (lecture PDFs often
- * omit spaces or use encodings where ASCII-only boundaries miss).
+ * Fuzzy fallback: single-token query vs whole word tokens in items (typo tolerance), not substrings.
+ */
+function collectFuzzyTokenMatches(items, pageNum, viewport, rawQuery, seen, matches) {
+  const q = (rawQuery || '').trim();
+  if (!q || /\s/.test(q) || q.length < 2) return;
+  const qLower = q.toLowerCase();
+  const th = fuzzyRatioThreshold(q.length);
+  const maxDelta = maxLenDeltaForFuzzy(q.length);
+
+  for (const item of items) {
+    if (!('str' in item) || !item.str) continue;
+    const str = item.str;
+    let i = 0;
+    const n = str.length;
+    while (i < n) {
+      while (i < n && !isWordChar(str[i])) i += 1;
+      let j = i;
+      while (j < n && isWordChar(str[j])) j += 1;
+      if (j > i) {
+        const tok = str.slice(i, j);
+        const tLow = tok.toLowerCase();
+        if (tLow.length >= 2 && Math.abs(tLow.length - qLower.length) <= maxDelta) {
+          const r = keywordSimilarityRatio(q, tok);
+          if (r >= th) {
+            const bbox = subStringBBox(item, i, j, viewport, { tight: true });
+            const sn = str.slice(Math.max(0, i - 12), j + 12);
+            pushHitUnique({ page: pageNum, bbox, snippet: sn, match_type: 'fuzzy_token' }, matches, seen);
+          }
+        }
+      }
+      i = j;
+    }
+  }
+}
+
+/**
+ * Search embedded PDF text: complete keyword/phrase with word boundaries, then fuzzy whole-token
+ * fallback (single-token queries), then formatted-digit match. No partial-word substring hits.
  *
- * @returns {Array<{ page: number, bbox: number[], snippet: string }>}
+ * @returns {Array<{ page: number, bbox: number[], snippet: string, match_type?: string }>}
  */
 export async function findTextInPdf(pdf, rawQuery) {
   const q = rawQuery.trim();
   const qLower = q.toLowerCase();
   if (!qLower || !pdf) return [];
-  const useWholeWord = qLower.length >= 4;
   const matches = [];
-  const seen = new Set();
 
   for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
     const page = await pdf.getPage(pageNum);
     const viewport = page.getViewport({ scale: 1 });
     const { items } = await page.getTextContent({ normalizeWhitespace: true });
 
-    const countStart = matches.length;
+    const pageHits = [];
+    const pageSeen = new Set();
+    const countStart = 0;
 
-    if (useWholeWord) {
-      for (const hit of findInPageLines(items, pageNum, viewport, qLower, true)) {
-        pushHitUnique(hit, matches, seen);
-      }
+    for (const hit of findInPageLinesBoundary(items, pageNum, viewport, qLower)) {
+      pushHitUnique(hit, pageHits, pageSeen);
+    }
 
-      if (matches.length === countStart) {
-        for (const item of items) {
-          if (!('str' in item) || !item.str) continue;
-          const low = item.str.toLowerCase();
-          for (const idx of wholeWordIndices(low, qLower)) {
-            const bbox = subStringBBox(item, idx, idx + qLower.length, viewport, { tight: true });
-            const sn = item.str.slice(Math.max(0, idx - 12), idx + qLower.length + 12);
-            pushHitUnique({ page: pageNum, bbox, snippet: sn }, matches, seen);
-          }
-        }
-      }
+    if (pageHits.length === countStart) {
+      collectItemBoundaryMatches(items, pageNum, viewport, qLower, pageSeen, pageHits);
+    }
 
-      /* Still nothing: substring on merged lines + per item (COA-style notes, glued words). */
-      if (matches.length === countStart) {
-        for (const hit of findInPageLines(items, pageNum, viewport, qLower, false)) {
-          pushHitUnique(hit, matches, seen);
-        }
-      }
-      if (matches.length === countStart) {
-        collectItemSubstringMatches(items, pageNum, viewport, qLower, seen, matches);
-      }
-    } else {
-      for (const hit of findInPageLines(items, pageNum, viewport, qLower, false)) {
-        pushHitUnique(hit, matches, seen);
-      }
-      if (matches.length === countStart) {
-        collectItemSubstringMatches(items, pageNum, viewport, qLower, seen, matches);
-      }
+    if (pageHits.length === countStart) {
+      collectFuzzyTokenMatches(items, pageNum, viewport, q, pageSeen, pageHits);
     }
 
     const flexRe = buildFlexibleDigitSequenceRegex(digitsOnly(q));
-    if (flexRe && matches.length === countStart) {
-      collectDigitFormattedLineMatches(items, pageNum, viewport, flexRe, seen, matches);
-      if (matches.length === countStart) {
-        collectDigitFormattedItemMatches(items, pageNum, viewport, flexRe, seen, matches);
+    if (flexRe && pageHits.length === countStart) {
+      collectDigitFormattedLineMatches(items, pageNum, viewport, flexRe, pageSeen, pageHits);
+      if (pageHits.length === countStart) {
+        collectDigitFormattedItemMatches(items, pageNum, viewport, flexRe, pageSeen, pageHits);
       }
     }
+
+    matches.push(...dedupeEmbeddedHitsOnPage(pageHits));
   }
   return matches;
 }

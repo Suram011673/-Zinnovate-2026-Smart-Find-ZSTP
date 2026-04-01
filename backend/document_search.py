@@ -71,13 +71,25 @@ def _is_word_char(c: str) -> bool:
 
 
 def _word_boundary_ok(text: str, idx: int, q_len: int) -> bool:
-    """For queries length >= 4, prefer word boundaries (Unicode-aware for OCR)."""
-    if q_len < 4:
-        return True
+    """Whole keyword / phrase only — not a substring inside a longer word (Unicode-aware)."""
+    if q_len < 1:
+        return False
     if idx > 0 and _is_word_char(text[idx - 1]):
         return False
     end = idx + q_len
     if end < len(text) and _is_word_char(text[end]):
+        return False
+    return True
+
+
+def _nospace_run_boundary_ok(cat: str, idx: int, qlen: int) -> bool:
+    """No-space merged line: do not match in the middle of an alphanumeric run."""
+    if qlen < 1 or idx < 0 or idx + qlen > len(cat):
+        return False
+    if idx > 0 and _is_word_char(cat[idx - 1]):
+        return False
+    end = idx + qlen
+    if end < len(cat) and _is_word_char(cat[end]):
         return False
     return True
 
@@ -175,8 +187,8 @@ def _bbox_for_norm_merged_substring(
     return _union_bbox_coords(boxes)
 
 
-# Min length of digit-only key for formatted-number matching (avoids noise on "12", "2024" fragments)
-MIN_DIGIT_QUERY_LEN = 4
+# Min length of digit-only key for formatted-number matching (e.g. amounts like 300)
+MIN_DIGIT_QUERY_LEN = 3
 
 
 def _digits_only(s: str) -> str:
@@ -487,35 +499,10 @@ def search_ocr_blocks(blocks: list[dict[str, Any]], query: str) -> list[dict[str
                     hit["snippet"],
                     "digit_formatted",
                 )
-        if out:
-            return out
-
-    # 1b) Same as (1) but allow glued OCR tokens (no word-boundary check)
-    for b in blocks:
-        text = (b.get("text") or "").strip()
-        if not text:
-            continue
-        low = text.lower()
-        qlow = q_raw.lower()
-        idx = low.find(qlow)
-        if idx < 0:
-            continue
-        n = max(len(text), 1)
-        x0, y0, x1, y1 = (float(x) for x in b["bbox"])
-        w = max(0.0, x1 - x0)
-        t0, t1 = idx / n, (idx + len(q_raw)) / n
-        bbox = [x0 + w * t0, y0, x0 + w * t1, y1]
-        add_match(
-            int(b.get("page", 1)),
-            bbox,
-            text[max(0, idx - 10) : idx + len(q_raw) + 10],
-            "exact_substring",
-        )
-
     if out:
         return out
 
-    # 2) Merged lines: substring on normalized / no-space
+    # 2) Merged lines: boundary-safe substring on normalized / no-space
     qd_merged = _digits_only(q_raw)
     for line_blocks in group_ocr_blocks_into_lines(blocks):
         texts = [(b.get("text") or "").strip() for b in line_blocks]
@@ -523,7 +510,7 @@ def search_ocr_blocks(blocks: list[dict[str, Any]], query: str) -> list[dict[str
         merged_ns = _norm_nospace(" ".join(texts))
         page = int(line_blocks[0].get("page", 1))
         line_hit = False
-        if len(qn) >= 4 and not single_word_query:
+        if len(qn) >= 3 and not single_word_query:
             pos = 0
             while True:
                 idx = merged.find(qn, pos)
@@ -537,29 +524,24 @@ def search_ocr_blocks(blocks: list[dict[str, Any]], query: str) -> list[dict[str
                 pos = idx + 1
         elif qn and qn in merged and not single_word_query:
             idx = merged.find(qn)
-            bb = _bbox_for_norm_merged_substring(line_blocks, merged, idx, len(qn))
-            add_match(page, bb, merged[:120], "line")
-            line_hit = True
+            if idx >= 0 and _word_boundary_ok(merged, idx, len(qn)):
+                bb = _bbox_for_norm_merged_substring(line_blocks, merged, idx, len(qn))
+                add_match(page, bb, merged[:120], "line")
+                line_hit = True
 
-        if not line_hit and len(q_ns) >= 4 and q_ns in merged_ns:
-            bb = _bbox_for_nospace_substring(line_blocks, q_ns)
-            if bb is None:
-                idx_ns = merged_ns.find(q_ns)
-                bb = _narrow_line_bbox_to_query(line_blocks, idx_ns, len(q_ns), len(merged_ns))
-            add_match(page, bb, merged[:120], "line_nospace")
-            line_hit = True
+        if not line_hit and len(q_ns) >= 3 and q_ns in merged_ns:
+            idx_ns = merged_ns.find(q_ns)
+            if idx_ns >= 0 and _nospace_run_boundary_ok(merged_ns, idx_ns, len(q_ns)):
+                bb = _bbox_for_nospace_substring(line_blocks, q_ns)
+                if bb is None:
+                    bb = _narrow_line_bbox_to_query(line_blocks, idx_ns, len(q_ns), len(merged_ns))
+                add_match(page, bb, merged[:120], "line_nospace")
+                line_hit = True
 
         if not line_hit and len(qd_merged) >= MIN_DIGIT_QUERY_LEN:
             bb_d = _bbox_for_digit_only_concat_substring(line_blocks, qd_merged)
             if bb_d is not None:
                 add_match(page, bb_d, merged[:120], "line_digits")
-                line_hit = True
-
-        if not line_hit and len(qn) >= 4 and not single_word_query:
-            idx = merged.find(qn)
-            if idx >= 0:
-                bb = _bbox_for_norm_merged_substring(line_blocks, merged, idx, len(qn))
-                add_match(page, bb, merged[:120], "line_substring")
                 line_hit = True
 
         if line_hit:
@@ -580,7 +562,18 @@ def search_ocr_blocks(blocks: list[dict[str, Any]], query: str) -> list[dict[str
                 if qn not in merged and " " not in q_raw.strip():
                     continue
                 if qn in merged:
-                    idx_f = merged.find(qn)
+                    idx_f = -1
+                    pos_fm = 0
+                    while True:
+                        j = merged.find(qn, pos_fm)
+                        if j < 0:
+                            break
+                        if _word_boundary_ok(merged, j, len(qn)):
+                            idx_f = j
+                            break
+                        pos_fm = j + 1
+                    if idx_f < 0:
+                        continue
                     bb = _bbox_for_norm_merged_substring(line_blocks, merged, idx_f, len(qn))
                     snip = merged[:120]
                 else:
@@ -598,21 +591,50 @@ def search_ocr_blocks(blocks: list[dict[str, Any]], query: str) -> list[dict[str
     if out:
         return out
 
-    # 3) Fuzzy per block — short handwritten names can need this fallback.
-    if len(qn) < 4:
+    # 3) Fuzzy per word token (typo-tolerant whole keyword, not a short substring inside a longer word).
+    if len(qn) < 3:
         return out
 
-    pr_need_block, r_need_block = _block_fuzzy_thresholds(q_raw, qn)
+    _pr_need_block, r_need_block = _block_fuzzy_thresholds(q_raw, qn)
     for b in blocks:
         text = (b.get("text") or "").strip()
         if len(text) < 2:
             continue
-        tn = _norm(text)
-        pr = fuzz.partial_ratio(qn, tn)
-        r = fuzz.ratio(qn, tn)
-        if pr >= pr_need_block or r >= r_need_block:
-            if " " in q_raw.strip() and len(q_ns) >= 6 and q_ns not in _norm_nospace(tn):
+        if single_word_query:
+            hit = False
+            i = 0
+            n = len(text)
+            while i < n:
+                while i < n and not _is_word_char(text[i]):
+                    i += 1
+                j = i
+                while j < n and _is_word_char(text[j]):
+                    j += 1
+                if j > i:
+                    tok = text[i:j]
+                    tn = _norm(tok)
+                    if len(tn) >= 2 and abs(len(tn) - len(qn)) <= max(2, len(qn) // 2 + 1):
+                        r = fuzz.ratio(qn, tn)
+                        if r >= r_need_block:
+                            bb = _slice_block_bbox_by_char_span(b, text, i, j)
+                            add_match(
+                                int(b.get("page", 1)),
+                                bb,
+                                text[max(0, i - 8) : j + 8],
+                                "fuzzy_block",
+                            )
+                            hit = True
+                            break
+                i = j
+            if hit:
                 continue
+            continue
+
+        tn = _norm(text)
+        if " " in q_raw.strip() and len(q_ns) >= 6 and q_ns not in _norm_nospace(tn):
+            continue
+        ts = fuzz.token_set_ratio(qn, tn)
+        if ts >= max(r_need_block - 2, 78):
             add_match(
                 int(b.get("page", 1)),
                 [float(x) for x in b["bbox"]],
