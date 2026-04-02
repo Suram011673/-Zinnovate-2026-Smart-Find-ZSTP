@@ -4,6 +4,8 @@ Full-stack app: **PyMuPDF** text + **Tesseract** and **EasyOCR** for scans, then
 
 ## Prerequisites
 
+Short install checklist: **[PREREQUISITES.md](PREREQUISITES.md)**.
+
 - **Python 3.10+** (with `pip`). On Windows, **`py -3`** (Python Launcher) works if `python` is not on PATH; batch helpers use **`py-or-python.bat`** (tries `py -3`, then `python`).
 - **Node.js 18+** and npm
 - **Tesseract OCR** on your PATH when Tesseract is used (Windows: [Tesseract](https://github.com/UB-Mannheim/tesseract/wiki)).
