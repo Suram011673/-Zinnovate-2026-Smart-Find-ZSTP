@@ -100,6 +100,44 @@ def _ingest_pdf(data: bytes, filename: str, **extract_kw: Any) -> str:
     return doc_id
 
 
+def _store_pdf_light(data: bytes, filename: str) -> str:
+    """
+    Store PDF bytes + PyMuPDF text only (no Tesseract/EasyOCR). Fast path before POST /extract-documents.
+    """
+    blocks = pp.extract_text_blocks_pymupdf(data)
+    blocks_json = pp.blocks_to_json(blocks)
+    doc_id = str(uuid.uuid4())
+    _session_docs[doc_id] = {
+        "filename": filename,
+        "pdf_bytes": data,
+        "blocks": blocks_json,
+        "fields": [],
+        "block_count": len(blocks),
+        "extraction_pending": True,
+    }
+    return doc_id
+
+
+def _apply_full_extraction(doc_id: str, **extract_kw: Any) -> None:
+    """Run full OCR + field pipeline on an already stored document."""
+    d = _session_docs.get(doc_id)
+    if not d or not d.get("pdf_bytes"):
+        raise HTTPException(status_code=404, detail=f"Unknown document: {doc_id}")
+    data = bytes(d["pdf_bytes"])
+    blocks, detected = afe.extract_fields_for_pdf(data, **extract_kw)
+    fields: list[dict[str, Any]] = []
+    for row in detected:
+        r = dict(row)
+        r["status"] = "pending"
+        r = attach_priorities([r])[0]
+        fields.append(r)
+    blocks_json = pp.blocks_to_json(blocks)
+    d["blocks"] = blocks_json
+    d["fields"] = fields
+    d["block_count"] = len(blocks)
+    d["extraction_pending"] = False
+
+
 def _documents_for_batch_search() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for did in _session_order:
@@ -122,6 +160,13 @@ class CompleteFieldBody(BaseModel):
 
 class ActiveDocumentBody(BaseModel):
     document_id: str = Field(..., description="Session document id from GET /documents")
+
+
+class ExtractDocumentsBody(BaseModel):
+    document_ids: list[str] | None = Field(
+        None,
+        description="If omitted or empty, run full OCR/extraction on every document in the session.",
+    )
 
 
 class SendSessionEmailBody(BaseModel):
@@ -718,6 +763,91 @@ def _extract_kw(
     }
 
 
+@app.post("/extract-documents")
+def extract_documents(
+    body: ExtractDocumentsBody | None = None,
+    ocr: bool = Query(True),
+    aggressive_ocr: bool = Query(True),
+    handwriting_merge: bool = Query(False),
+    dynamic_fields: bool = Query(True),
+    use_openai: bool = Query(False),
+    use_gpt_validate: bool = Query(False),
+    use_transformers: bool = Query(False),
+) -> dict[str, Any]:
+    """
+    Run full OCR + field extraction on stored PDF(s). Use after upload with ``defer_extraction=true``.
+    If ``document_ids`` is omitted or empty, processes every document in the current session.
+    """
+    kw = _extract_kw(
+        ocr=ocr,
+        aggressive_ocr=aggressive_ocr,
+        handwriting_merge=handwriting_merge,
+        dynamic_fields=dynamic_fields,
+        use_openai=use_openai,
+        use_gpt_validate=use_gpt_validate,
+        use_transformers=use_transformers,
+    )
+    ids = list((body.document_ids if body else None) or [])
+    if not ids:
+        ids = list(_session_order)
+    if not ids:
+        raise HTTPException(status_code=400, detail="No documents in session to extract.")
+    errors: list[dict[str, Any]] = []
+    for did in ids:
+        if did not in _session_docs:
+            errors.append({"document_id": did, "detail": "not in session"})
+            continue
+        try:
+            _apply_full_extraction(did, **kw)
+        except Exception as e:
+            logger.exception("extract-documents failed: %s", did)
+            errors.append({"document_id": did, "detail": str(e)})
+
+    documents_out: list[dict[str, Any]] = []
+    for did in _session_order:
+        if did not in _session_docs:
+            continue
+        d = _session_docs[did]
+        documents_out.append(
+            {
+                "document_id": did,
+                "filename": d["filename"],
+                "field_count": len(d.get("fields") or []),
+                "block_count": int(d.get("block_count") or 0),
+            }
+        )
+
+    if not _session_active_id or _session_active_id not in _session_docs:
+        raise HTTPException(status_code=500, detail="Session state inconsistent after extract.")
+
+    first = _session_docs[_session_active_id]
+    nfields = len(first["fields"])
+    nblocks = first["block_count"]
+    out: dict[str, Any] = {
+        "ok": len(errors) == 0,
+        "documents": documents_out,
+        "active_document_id": _session_active_id,
+        "errors": errors,
+        "fields": [_normalize_field(f) for f in first["fields"]],
+        "block_count": nblocks,
+        "extraction_empty": nfields == 0,
+        "extraction_pending": False,
+    }
+    if not first["fields"]:
+        if nblocks == 0:
+            out["hint"] = (
+                "No text was extracted (0 blocks). Open GET /health/ocr in the API to verify OCR. "
+                "Install Tesseract for scans."
+            )
+        else:
+            out["hint"] = (
+                f"OCR found {nblocks} text snippets but no label:value fields. "
+                "Try OPENAI_API_KEY or a clearer scan."
+            )
+    _log_nav("EXTRACT", f"docs={ids} errors={len(errors)}")
+    return out
+
+
 @app.post("/upload-pdf")
 async def upload_pdf(
     file: UploadFile = File(...),
@@ -729,6 +859,10 @@ async def upload_pdf(
     use_gpt_validate: bool = False,
     use_transformers: bool = False,
     include_blocks: bool = False,
+    defer_extraction: bool = Query(
+        False,
+        description="If true, only store PDF + fast PyMuPDF text; run POST /extract-documents for OCR/fields.",
+    ),
 ) -> dict[str, Any]:
     """
     Upload one PDF; replaces the session with a single document (same as batch with one file).
@@ -738,16 +872,20 @@ async def upload_pdf(
     data = await file.read()
     global _session_docs, _session_order, _session_active_id
     _session_clear()
+    kw = _extract_kw(
+        ocr=ocr,
+        aggressive_ocr=aggressive_ocr,
+        handwriting_merge=handwriting_merge,
+        dynamic_fields=dynamic_fields,
+        use_openai=use_openai,
+        use_gpt_validate=use_gpt_validate,
+        use_transformers=use_transformers,
+    )
     try:
-        doc_id = _ingest_pdf(data, file.filename, **_extract_kw(
-            ocr=ocr,
-            aggressive_ocr=aggressive_ocr,
-            handwriting_merge=handwriting_merge,
-            dynamic_fields=dynamic_fields,
-            use_openai=use_openai,
-            use_gpt_validate=use_gpt_validate,
-            use_transformers=use_transformers,
-        ))
+        if defer_extraction:
+            doc_id = _store_pdf_light(data, file.filename)
+        else:
+            doc_id = _ingest_pdf(data, file.filename, **kw)
     except Exception as e:
         logger.exception("PDF / AI extraction failed")
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -774,10 +912,16 @@ async def upload_pdf(
         "block_count": nblocks,
         "fields": [_normalize_field(f) for f in ad["fields"]],
         "extraction_empty": nfields == 0,
+        "extraction_pending": bool(ad.get("extraction_pending")),
     }
     if not ad["fields"]:
         logger.warning("Upload produced no fields: %s blocks=%s", file.filename, nblocks)
-        if nblocks == 0:
+        if ad.get("extraction_pending"):
+            out["hint"] = (
+                "PDF stored. Full OCR and field extraction will run next (POST /extract-documents). "
+                "Image-only PDFs may show 0 text blocks until then."
+            )
+        elif nblocks == 0:
             out["hint"] = (
                 "No text was extracted (0 blocks). Open GET /health/ocr in the API to verify OCR. "
                 "Install Tesseract (https://github.com/UB-Mannheim/tesseract/wiki) or run install-tesseract-windows.ps1; "
@@ -810,6 +954,10 @@ async def upload_pdf_batch(
     use_gpt_validate: bool = Query(False),
     use_transformers: bool = Query(False),
     min_match_score: float = Query(62.0, ge=40.0, le=100.0),
+    defer_extraction: bool = Query(
+        False,
+        description="If true, only store PDFs + fast PyMuPDF text; run POST /extract-documents for OCR/fields.",
+    ),
 ) -> dict[str, Any]:
     """
     Upload one or more PDFs. Multipart: **files**; optional **checks**, **transaction_type**,
@@ -817,6 +965,11 @@ async def upload_pdf_batch(
     """
     if not files:
         raise HTTPException(status_code=400, detail="No PDFs received (empty files list).")
+    if defer_extraction and checks is not None and str(checks).strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot combine defer_extraction with batch checks; call POST /extract-documents first, then re-run verification if needed.",
+        )
 
     kw = _extract_kw(
         ocr=ocr,
@@ -845,7 +998,10 @@ async def upload_pdf_batch(
             continue
         data = await file.read()
         try:
-            doc_id = _ingest_pdf(data, fn, **kw)
+            if defer_extraction:
+                doc_id = _store_pdf_light(data, fn)
+            else:
+                doc_id = _ingest_pdf(data, fn, **kw)
         except Exception as e:
             logger.exception("batch upload extraction failed: %s", fn)
             errors.append({"upload_index": upload_index, "filename": fn, "detail": str(e)})
@@ -905,6 +1061,7 @@ async def upload_pdf_batch(
             }
 
     first = _session_docs[_session_active_id]
+    any_pending = any(bool(_session_docs[d].get("extraction_pending")) for d in _session_order if d in _session_docs)
     out: dict[str, Any] = {
         "ok": True,
         "documents": documents_out,
@@ -914,9 +1071,14 @@ async def upload_pdf_batch(
         "block_count": first["block_count"],
         "extraction_empty": len(first["fields"]) == 0,
         "session_context": dict(_session_context),
+        "extraction_pending": any_pending,
     }
     if not first["fields"]:
-        if first["block_count"] == 0:
+        if any_pending:
+            out["hint"] = (
+                "PDFs stored. Full OCR and field extraction will run next (POST /extract-documents)."
+            )
+        elif first["block_count"] == 0:
             out["hint"] = (
                 "No text was extracted (0 blocks). Open GET /health/ocr in the API to verify OCR."
             )

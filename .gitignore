@@ -1,4 +1,6 @@
-# --- Python ---
+# Track source, configs, assets, and docs. Ignore generated deps, caches, secrets, and build output.
+
+# --- Python (deps & bytecode — never commit venv) ---
 .venv/
 venv/
 env/
@@ -11,7 +13,6 @@ __pycache__/
 .eggs/
 *.egg
 build/
-# setuptools / wheel output (also avoids committing random "dist" folders)
 dist/
 
 # --- Node ---
@@ -21,14 +22,17 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# Vite production build — regenerate with: cd frontend && npm run build
+# --- Frontend build (regenerate: cd frontend && npm run build) ---
 frontend/dist/
 
-# --- Env / secrets (never commit) ---
+# --- Env / secrets ---
 .env
 .env.local
 .env.*.local
 *.pem
+
+# --- Logs & runtime ---
+*.log
 
 # --- Tooling / tests ---
 .pytest_cache/
@@ -37,7 +41,7 @@ frontend/dist/
 .coverage
 htmlcov/
 
-# --- IDE / OS ---
+# --- IDE / OS (personal machine settings — remove a line below if your team commits shared configs) ---
 .idea/
 .vscode/
 *.swp

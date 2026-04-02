@@ -73,10 +73,12 @@ function searchMatchPriority(m, rawQuery) {
   }
   const mt = m.match_type || 'exact';
   if (mt === 'exact') return digitOnly ? 420 : 300;
+  if (mt === 'exact_loose') return digitOnly ? 412 : 292;
   if (mt === 'exact_substring') return digitOnly ? 400 : 285;
   if (mt === 'digit_formatted') return digitOnly ? 418 : 277;
   if (mt === 'line_digits') return digitOnly ? 416 : 217;
-  if (mt === 'line' || mt === 'line_nospace' || mt === 'line_substring') return 220;
+  if (mt === 'line' || mt === 'line_merged_word' || mt === 'line_nospace' || mt === 'line_substring')
+    return 220;
   if (mt === 'fuzzy_block') return 120;
   if (mt === 'fuzzy_line' || mt === 'fuzzy_line_tokens') return 60;
   return 200;
@@ -167,6 +169,74 @@ function bboxSameSearchLocation(a, b) {
   return false;
 }
 
+function bboxCenterDist(a, b) {
+  if (!a?.length || !b?.length) return Infinity;
+  const acx = (a[0] + a[2]) / 2;
+  const acy = (a[1] + a[3]) / 2;
+  const bcx = (b[0] + b[2]) / 2;
+  const bcy = (b[1] + b[3]) / 2;
+  return Math.hypot(acx - bcx, acy - bcy);
+}
+
+/**
+ * Merge only true duplicates (same ink span, embedded vs OCR overlay, or duplicate match_types).
+ * Handwriting: many OCR boxes on one line — use stricter rules when both hits are OCR so we
+ * do not collapse distinct words. Looser rules only when embedded + OCR disagree on the same spot.
+ */
+function isSameSearchDuplicate(r, m, rawQuery) {
+  if (r.document_id !== m.document_id || r.page !== m.page) return false;
+  const ra = r.bbox || [];
+  const ma = m.bbox || [];
+  if (!ra.length || !ma.length) return false;
+  const rs = r.source || '';
+  const ms = m.source || '';
+  const crossLayer = rs !== ms;
+
+  if (bboxSameSearchLocation(ra, ma)) return true;
+
+  if (crossLayer) {
+    if (bboxIou(ra, ma) > 0.22) return true;
+    if (bboxOverlapOfSmaller(ra, ma) > 0.38) return true;
+    const q = (rawQuery || '').trim().toLowerCase();
+    if (q.length >= 4) {
+      const nsr = normSearchSnippet(r.snippet);
+      const nsm = normSearchSnippet(m.snippet);
+      if (nsr.includes(q) && nsm.includes(q) && bboxCenterDist(ra, ma) < 44) return true;
+    }
+    const qn = normSearchSnippet(rawQuery);
+    const snippetDedupeMinLen = Math.min(12, Math.max(4, (rawQuery || '').trim().length || 0));
+    const nsr = normSearchSnippet(r.snippet);
+    const nsm = normSearchSnippet(m.snippet);
+    if (
+      qn.length >= 4 &&
+      nsr.length >= snippetDedupeMinLen &&
+      nsr === nsm &&
+      (bboxIou(ra, ma) > 0.08 || bboxOverlapOfSmaller(ra, ma) > 0.42)
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  /* Both embedded or both OCR: avoid merging adjacent words / separate handwritten fragments */
+  if (bboxIou(ra, ma) > 0.48) return true;
+  if (bboxOverlapOfSmaller(ra, ma) > 0.58) return true;
+  if (bboxIou(ra, ma) > 0.28 && bboxCenterDist(ra, ma) < 20) return true;
+  const qn = normSearchSnippet(rawQuery);
+  const snippetDedupeMinLen = Math.min(12, Math.max(4, (rawQuery || '').trim().length || 0));
+  const nsr = normSearchSnippet(r.snippet);
+  const nsm = normSearchSnippet(m.snippet);
+  if (
+    qn.length >= 4 &&
+    nsr.length >= snippetDedupeMinLen &&
+    nsr === nsm &&
+    (bboxIou(ra, ma) > 0.2 || bboxOverlapOfSmaller(ra, ma) > 0.5)
+  ) {
+    return true;
+  }
+  return false;
+}
+
 function mergeAndDedupeSearchMatches(localTagged, serverMatches, orderIdx, rawQuery) {
   const merged = [...localTagged, ...serverMatches];
   merged.sort((a, b) => {
@@ -177,29 +247,19 @@ function mergeAndDedupeSearchMatches(localTagged, serverMatches, orderIdx, rawQu
     const db = orderIdx[b.document_id] ?? 999;
     if (da !== db) return da - db;
     if (a.page !== b.page) return a.page - b.page;
-    return compareSearchMatchReadingOrder(a, b, orderIdx);
+    const c = compareSearchMatchReadingOrder(a, b, orderIdx);
+    if (c !== 0) return c;
+    /* Stable tie-break: same priority + position → deterministic order (avoids 5 vs 8 style flips). */
+    const sa = `${a.source || ''}\0${a.match_type || ''}`;
+    const sb = `${b.source || ''}\0${b.match_type || ''}`;
+    if (sa !== sb) return sa < sb ? -1 : 1;
+    const ba = (a.bbox || []).map((x) => Math.round(Number(x) * 100) / 100).join(',');
+    const bb = (b.bbox || []).map((x) => Math.round(Number(x) * 100) / 100).join(',');
+    return ba < bb ? -1 : ba > bb ? 1 : 0;
   });
   const out = [];
-  const qn = normSearchSnippet(rawQuery);
-  const snippetDedupeMinLen = Math.min(12, Math.max(4, (rawQuery || '').trim().length || 0));
   for (const m of merged) {
-    const dup = out.some((r) => {
-      if (r.document_id !== m.document_id || r.page !== m.page) return false;
-      const ra = r.bbox || [];
-      const ma = m.bbox || [];
-      if (bboxSameSearchLocation(ra, ma)) return true;
-      const nsr = normSearchSnippet(r.snippet);
-      const nsm = normSearchSnippet(m.snippet);
-      if (
-        qn.length >= 4 &&
-        nsr.length >= snippetDedupeMinLen &&
-        nsr === nsm &&
-        (bboxIou(ra, ma) > 0.08 || bboxOverlapOfSmaller(ra, ma) > 0.42)
-      ) {
-        return true;
-      }
-      return false;
-    });
+    const dup = out.some((r) => isSameSearchDuplicate(r, m, rawQuery));
     if (!dup) out.push(m);
   }
   /* Find / Prev / Next: always follow visual top → bottom (then left → right), not match-type or box size. */
@@ -218,7 +278,8 @@ export default function App() {
   const [searchIndex, setSearchIndex] = useState(0);
   const [searchBusy, setSearchBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
-  const [uploadingText, setUploadingText] = useState('');
+  /** 'upload' = sending PDF; 'extract' = server OCR/fields — drives branded Loading UI */
+  const [processingPhase, setProcessingPhase] = useState(null);
   const [readableDoc, setReadableDoc] = useState(null);
   const [transcriptBusy, setTranscriptBusy] = useState(false);
   const [documentsList, setDocumentsList] = useState([]);
@@ -227,6 +288,14 @@ export default function App() {
   /** Last Find: how many session PDFs contain the keyword vs how many were searched */
   const [searchPdfStats, setSearchPdfStats] = useState(null);
   const [headerLogoIdx, setHeaderLogoIdx] = useState(0);
+  /** Must be checked to run OCR/extraction after upload and to use Find. Starts unchecked each session until the user opts in. */
+  const [readyToSearch, setReadyToSearch] = useState(false);
+  /** True after deferred upload until POST /extract-documents completes (or upload had nothing pending). */
+  const [extractionPending, setExtractionPending] = useState(false);
+  const pendingExtractOptionsRef = useRef(null);
+  const searchTextRef = useRef('');
+  const onSearchPdfRef = useRef(async () => {});
+  const pendingAutoFindAfterOcrRef = useRef(false);
   const docFilesRef = useRef({});
   const activeDocRef = useRef(null);
 
@@ -278,6 +347,10 @@ export default function App() {
     activeDocRef.current = activeDocumentId;
   }, [activeDocumentId]);
 
+  useEffect(() => {
+    searchTextRef.current = searchText;
+  }, [searchText]);
+
   /** Do not clear search when pdfFile changes for multi-PDF viewing (Find / Prev / Next). */
   useEffect(() => {
     if (!pdfFile) setReadableDoc(null);
@@ -315,6 +388,11 @@ export default function App() {
     }
   }, []);
 
+  /** Restore session document list after reload so Find can use server blocks without local File blobs. */
+  useEffect(() => {
+    void refreshDocuments();
+  }, [refreshDocuments]);
+
   const clearSearchResults = useCallback(() => {
     setSearchMatches([]);
     setSearchIndex(0);
@@ -341,6 +419,10 @@ export default function App() {
     setPdfFile(null);
     docFilesRef.current = {};
     activeDocRef.current = null;
+    setReadyToSearch(false);
+    setExtractionPending(false);
+    pendingExtractOptionsRef.current = null;
+    pendingAutoFindAfterOcrRef.current = false;
     try {
       await api.resetSession();
     } catch {
@@ -349,11 +431,7 @@ export default function App() {
 
     setBusy(true);
     setUploading(true);
-    setUploadingText(
-      files.length === 1
-        ? 'Uploading and extracting fields for your PDF...'
-        : `Uploading ${files.length} PDFs and extracting fields...`,
-    );
+    setProcessingPhase('upload');
     setMsg('');
     setMsgErr(false);
     try {
@@ -363,11 +441,14 @@ export default function App() {
         use_openai: false,
         use_transformers: false,
         handwriting_merge: false,
+        defer_extraction: true,
       };
       const data =
         files.length === 1
           ? await api.uploadPdf(files[0], options)
           : await api.uploadPdfBatch(files, options, '', {});
+      pendingExtractOptionsRef.current = options;
+      setExtractionPending(!!data.extraction_pending);
       const map = {};
       if (files.length === 1) {
         const oneId = data.active_document_id || data.document_id;
@@ -397,7 +478,11 @@ export default function App() {
         data.errors?.length > 0
           ? ` (${data.errors.length} file(s) failed)`
           : '';
-      if (!data.fields?.length) {
+      if (data.extraction_pending) {
+        setOk(
+          'PDF stored. Check "Ready to search" below to extract text, detect fields, and enable Find.',
+        );
+      } else if (!data.fields?.length) {
         setErr(
           (data.hint ||
             `No fields from ${fn0} (${data.block_count ?? 0} text blocks). Try OpenAI or clearer scan.`) +
@@ -414,7 +499,7 @@ export default function App() {
       setErr(formatApiError(err));
     } finally {
       setUploading(false);
-      setUploadingText('');
+      setProcessingPhase(null);
       setBusy(false);
     }
   };
@@ -444,13 +529,27 @@ export default function App() {
     [],
   );
 
+  const searchBlocked = !readyToSearch || extractionPending;
+
   const onSearchPdf = async () => {
     const q = searchText.trim();
     if (!q) {
       setErr('Enter text to search.');
       return;
     }
-    const searchEntries = (documentsList || [])
+    if (!readyToSearch) {
+      setErr('Check "Ready to search" to run Find.');
+      return;
+    }
+    if (extractionPending) {
+      setErr('Extraction is still running — wait until it finishes before Find.');
+      return;
+    }
+    setSearchMatches([]);
+    setSearchIndex(0);
+    setSearchPdfStats(null);
+
+    let searchEntries = (documentsList || [])
       .map((d) => ({
         document_id: d.document_id,
         file: docFilesById[d.document_id],
@@ -464,16 +563,43 @@ export default function App() {
         filename: pdfFile.name,
       });
     }
+
+    let docList = documentsList || [];
+    let actId = activeDocumentId;
     if (!searchEntries.length) {
+      try {
+        const d = await api.getDocuments();
+        const dl = d.documents || [];
+        if (dl.length) {
+          docList = dl;
+          actId = d.active_document_id || dl[0]?.document_id || actId;
+          setDocumentsList(dl);
+          if (d.active_document_id) {
+            setActiveDocumentId(d.active_document_id);
+          }
+        }
+      } catch {
+        /* no session — handled below */
+      }
+    }
+
+    const canSearchServer =
+      docList.length > 0 && (actId || docList[0]?.document_id);
+    if (!searchEntries.length && !canSearchServer) {
       setErr('No files loaded. Upload File(s) first.');
       return;
     }
+    if (!actId && docList[0]?.document_id) {
+      actId = docList[0].document_id;
+    }
+
     setSearchBusy(true);
     setMsg('');
     setMsgErr(false);
     try {
       await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-      const localTagged = await findTextInMultiplePdfs(searchEntries, q);
+      const localTagged =
+        searchEntries.length > 0 ? await findTextInMultiplePdfs(searchEntries, q) : [];
       let serverMatches = [];
       try {
         serverMatches = await api.documentSearch(q);
@@ -483,14 +609,14 @@ export default function App() {
         return;
       }
       const orderIdx = {};
-      (documentsList.length ? documentsList : searchEntries.map((e) => ({ document_id: e.document_id }))).forEach(
-        (d, i) => {
-          orderIdx[d.document_id] = i;
-        },
-      );
+      const orderSource =
+        docList.length > 0 ? docList : searchEntries.map((e) => ({ document_id: e.document_id }));
+      orderSource.forEach((d, i) => {
+        if (d.document_id) orderIdx[d.document_id] = i;
+      });
       const merged = mergeAndDedupeSearchMatches(localTagged, serverMatches, orderIdx, q);
       setSearchMatches(merged);
-      const pdfTotal = searchEntries.length;
+      const pdfTotal = docList.length || searchEntries.length || 1;
       const docIdsWithHits = new Set(merged.map((m) => m.document_id).filter(Boolean));
       const pdfWithHits = docIdsWithHits.size;
       setSearchPdfStats({
@@ -502,8 +628,8 @@ export default function App() {
       if (!merged.length) {
         setErr(
           pdfTotal > 1
-            ? `No matches — 0 of ${pdfTotal} PDFs contain “${q}” (embedded text + OCR). Try a shorter word or different spelling.`
-            : `No matches for “${q}” in embedded text or OCR. Try a shorter word or re-upload.`,
+            ? `No match found — 0 of ${pdfTotal} PDFs contain “${q}” in embedded text.`
+            : `No match found for “${q}” in embedded text.`,
         );
         return;
       }
@@ -511,11 +637,11 @@ export default function App() {
       await applySearchMatch(merged, 0, q);
       if (pdfTotal > 1) {
         setOk(
-          `“${q}” in ${pdfWithHits} of ${pdfTotal} PDFs · ${merged.length} match location${merged.length === 1 ? '' : 'es'} (embedded + OCR).`,
+          `“${q}” in ${pdfWithHits} of ${pdfTotal} PDFs · ${merged.length} match location${merged.length === 1 ? '' : 'es'}.`,
         );
       } else {
         setOk(
-          `Found ${merged.length} match${merged.length === 1 ? '' : 'es'} for “${q}” (embedded + OCR).`,
+          `Found ${merged.length} match${merged.length === 1 ? '' : 'es'} for “${q}”.`,
         );
       }
     } catch (e) {
@@ -524,6 +650,76 @@ export default function App() {
       setSearchBusy(false);
     }
   };
+
+  onSearchPdfRef.current = onSearchPdf;
+
+  /** OCR + field extraction: runs only after the user checks "Ready to search" (mandatory opt-in). */
+  useEffect(() => {
+    if (!readyToSearch || !extractionPending || !pendingExtractOptionsRef.current) return;
+    const opts = pendingExtractOptionsRef.current;
+    let cancelled = false;
+    (async () => {
+      setUploading(true);
+      setProcessingPhase('extract');
+      setBusy(true);
+      setMsg('');
+      setMsgErr(false);
+      try {
+        const data = await api.extractDocuments(opts);
+        if (cancelled) return;
+        setExtractionPending(false);
+        setDocumentsList(data.documents || []);
+        if (data.active_document_id) {
+          setActiveDocumentId(data.active_document_id);
+        }
+        void refreshDocuments();
+        const n = data.documents?.length ?? 0;
+        const fn0 = data.documents?.[0]?.filename ?? 'PDF';
+        const failNote =
+          data.errors?.length > 0
+            ? ` (${data.errors.length} file(s) failed)`
+            : '';
+        if (!data.fields?.length) {
+          setErr(
+            (data.hint ||
+              `No fields from ${fn0} (${data.block_count ?? 0} text blocks). Try OpenAI or clearer scan.`) +
+              failNote,
+          );
+        } else if (data.errors?.length) {
+          setOk(
+            `Ready: ${n} PDF(s) — viewing ${fn0}${failNote}. Check API errors for skipped files.`,
+          );
+        } else {
+          setOk(`Ready: ${n} PDF(s) — viewing ${fn0}`);
+        }
+        pendingAutoFindAfterOcrRef.current = !!(searchTextRef.current || '').trim();
+      } catch (extractErr) {
+        if (!cancelled) {
+          setErr(formatApiError(extractErr));
+          setExtractionPending(false);
+        }
+      } finally {
+        if (!cancelled) {
+          setUploading(false);
+          setProcessingPhase(null);
+          setBusy(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [readyToSearch, extractionPending, refreshDocuments]);
+
+  /** After OCR completes, re-run Find once if there was a non-empty query (avoids stale empty server index). */
+  useEffect(() => {
+    if (extractionPending || !readyToSearch) return;
+    if (!pendingAutoFindAfterOcrRef.current) return;
+    pendingAutoFindAfterOcrRef.current = false;
+    const q = (searchTextRef.current || '').trim();
+    if (!q) return;
+    void onSearchPdfRef.current();
+  }, [extractionPending, readyToSearch]);
 
   const onSearchPrev = () => {
     if (!searchMatches.length) return;
@@ -675,6 +871,24 @@ export default function App() {
 
           <section className="panel panel--search">
             <h2>Search</h2>
+            <label className="search-ready-label">
+              <input
+                type="checkbox"
+                checked={readyToSearch}
+                disabled={uploading || busy}
+                onChange={(e) => setReadyToSearch(e.target.checked)}
+                aria-required="true"
+                aria-describedby="search-ready-explainer"
+              />
+              <span>Ready to search</span>
+              <span className="search-ready-required" aria-hidden="true">
+                {' '}
+                (required)
+              </span>
+            </label>
+            <p id="search-ready-explainer" className="field-hint muted small search-ready-explainer">
+              Checking this box runs text extraction and field detection on your uploaded PDF(s), then unlocks Find.
+            </p>
             <p className="field-hint muted small">
               Type any word, number, or phrase — Find runs on that text only. All hits on the open Document
               highlight together; Prev/Next moves focus (accent + scroll).
@@ -684,7 +898,9 @@ export default function App() {
               className="search-input"
               placeholder="Search words, numbers, or phrases…"
               value={searchText}
-              disabled={searchBusy || (!documentsList.length && !pdfFile)}
+              disabled={
+                searchBusy || searchBlocked || (!documentsList.length && !pdfFile)
+              }
               onChange={(e) => setSearchText(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') onSearchPdf();
@@ -696,7 +912,10 @@ export default function App() {
                 type="button"
                 className="btn-primary"
                 disabled={
-                  searchBusy || !searchText.trim() || (!documentsList.length && !pdfFile)
+                  searchBusy ||
+                  searchBlocked ||
+                  !searchText.trim() ||
+                  (!documentsList.length && !pdfFile)
                 }
                 onClick={onSearchPdf}
               >
@@ -705,7 +924,7 @@ export default function App() {
               <button
                 type="button"
                 className="btn-secondary"
-                disabled={!searchMatches.length}
+                disabled={searchBlocked || !searchMatches.length}
                 onClick={onSearchPrev}
               >
                 Prev
@@ -713,7 +932,7 @@ export default function App() {
               <button
                 type="button"
                 className="btn-secondary"
-                disabled={!searchMatches.length}
+                disabled={searchBlocked || !searchMatches.length}
                 onClick={onSearchNext}
               >
                 Next
@@ -766,26 +985,44 @@ export default function App() {
           <div className="app-doc-frame" role="region" aria-label="PDF document view">
             <div className="app-doc-frame__chrome">
               <span className="app-doc-frame__title">Document</span>
-              {pdfFile ? (
-                <span className="app-doc-frame__filename" title={pdfFile.name}>
-                  {pdfFile.name}
-                </span>
-              ) : (
-                <span className="app-doc-frame__filename app-doc-frame__filename--placeholder">
-                  Upload a file to open the transaction document
-                </span>
-              )}
+              <div className="app-doc-frame__chrome-center">
+                {pdfFile ? (
+                  <span className="app-doc-frame__filename" title={pdfFile.name}>
+                    {pdfFile.name}
+                  </span>
+                ) : (
+                  <span className="app-doc-frame__filename app-doc-frame__filename--placeholder">
+                    Upload a file to open the transaction document
+                  </span>
+                )}
+              </div>
+              {uploading ? (
+                <div
+                  className="app-doc-frame__process app-doc-frame__process--branded"
+                  role="status"
+                  aria-live="polite"
+                  aria-label={
+                    processingPhase === 'upload'
+                      ? 'Uploading PDF'
+                      : processingPhase === 'extract'
+                        ? 'Loading document'
+                        : 'Loading'
+                  }
+                >
+                  <img
+                    className="app-doc-frame__process-logo"
+                    src={zinniaInsuranceLogo}
+                    alt=""
+                    width={112}
+                    height={22}
+                    decoding="async"
+                  />
+                  <span className="app-doc-frame__process-label">Loading</span>
+                  <span className="app-doc-frame__process-spinner" aria-hidden="true" />
+                </div>
+              ) : null}
             </div>
             <div className="app-main-pdf">
-              {uploading && (
-                <div className="pdf-upload-loader" role="status" aria-live="polite">
-                  <div className="pdf-upload-loader__spinner" aria-hidden="true" />
-                  <p className="pdf-upload-loader__title">Processing PDF</p>
-                  <p className="pdf-upload-loader__text">
-                    {uploadingText || 'This can take longer for scanned or handwritten files.'}
-                  </p>
-                </div>
-              )}
               <PDFViewer
                 key={activeDocumentId || 'none'}
                 ref={pdfViewerRef}
@@ -798,7 +1035,7 @@ export default function App() {
           {pdfFile && (
             <details className="ocr-transcript">
               <summary>
-                <span>OCR text (formatted)</span>
+                <span>Extracted text (formatted)</span>
                 <button
                   type="button"
                   className="btn-secondary"
@@ -815,11 +1052,11 @@ export default function App() {
               </summary>
               <div className="ocr-transcript-body">
                 <p className="muted small ocr-meta">
-                  Same OCR blocks power <strong>Find</strong> on scanned or image-only PDFs. Reading order + paragraph
-                  breaks; watermark tokens like EXAMPLE are filtered when alone.
+                  The same extracted text blocks power <strong>Find</strong> on scanned or image-only PDFs. Reading order +
+                  paragraph breaks; watermark tokens like EXAMPLE are filtered when alone.
                 </p>
                 {!readableDoc ? (
-                  <p className="muted">Click Refresh to load the OCR transcript from the server.</p>
+                  <p className="muted">Click Refresh to load the transcript from the server.</p>
                 ) : readableDoc.paragraph_count > 0 ? (
                   readableDoc.pages?.map((p) => (
                     <div key={p.page} className="ocr-page">
@@ -834,8 +1071,8 @@ export default function App() {
                 ) : (
                   <p className="muted">
                     {readableDoc.line_count === 0
-                      ? 'No OCR text in the last upload (0 blocks). Check Tesseract/EasyOCR and try SMART_FIND_HANDWRITING_MODE=1 on the API.'
-                      : 'No paragraphs yet — OCR only returned noise (e.g. watermark), or gaps did not form paragraphs.'}
+                      ? 'No extracted text in the last upload (0 blocks). Check Tesseract/EasyOCR on the API or SMART_FIND_HANDWRITING_MODE=1.'
+                      : 'No paragraphs yet — only noise was extracted (e.g. watermark), or gaps did not form paragraphs.'}
                   </p>
                 )}
               </div>

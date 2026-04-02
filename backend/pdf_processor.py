@@ -28,14 +28,13 @@ def _ocr_boost_for_ink(handwriting_merge: bool) -> bool:
     return _handwriting_ocr_mode() or bool(handwriting_merge)
 
 
-def _merge_mixed_native_ocr(handwriting_merge: bool) -> bool:
+def _merge_mixed_native_ocr() -> bool:
     """
     Full-page raster OCR merged into *every* page that already has native text — very slow on long digital PDFs.
 
-    Enable only via SMART_FIND_MIXED_PAGE_OCR=1 (typed forms with ink overlays). ``handwriting_merge`` no longer
-    turns this on; it only boosts weak/scanned pages via :func:`_ocr_boost_for_ink`.
+    Enable only via SMART_FIND_MIXED_PAGE_OCR=1 (typed forms with ink overlays). Handwriting boost is handled
+    separately via :func:`_ocr_boost_for_ink` on weak/scanned pages.
     """
-    _ = handwriting_merge  # kept for API compatibility; no longer ties to mixed merge
     return os.environ.get("SMART_FIND_MIXED_PAGE_OCR", "").lower() in ("1", "true", "yes")
 
 
@@ -273,7 +272,8 @@ def _pick_best_ocr_layer(
     st = sum(len(b.text) for b in tesseract_blocks)
     se = sum(len(b.text) for b in easyocr_blocks)
     ne, nt = len(easyocr_blocks), len(tesseract_blocks)
-    if ne > 0 and (se >= st * 0.75 or ne >= max(3, nt)):
+    # Slightly easier to pick EasyOCR so ink / cursive is not lost to a noisy Tesseract layer.
+    if ne > 0 and (se >= st * 0.68 or ne >= max(3, nt) or (se > st * 0.5 and ne > nt)):
         return easyocr_blocks
     if tesseract_blocks:
         return tesseract_blocks
@@ -325,32 +325,94 @@ def _tesseract_text_score(blocks: list[TextBlock]) -> int:
     return sum(len(re.sub(r"\s+", "", b.text or "")) for b in blocks)
 
 
+def _tesseract_word_count(blocks: list[TextBlock]) -> int:
+    return sum(1 for b in blocks if (b.text or "").strip())
+
+
 def _skip_easyocr_after_tesseract(tesseract_blocks: list[TextBlock]) -> bool:
     """
-    EasyOCR is very slow on CPU. If Tesseract already returned enough text, skip EasyOCR.
-    Set SMART_FIND_TESS_SUFFICIENT_CHARS=0 to always run both (old behavior).
-    Set SMART_FIND_OCR_ALWAYS_EASYOCR=1 to always run EasyOCR after Tesseract.
+    EasyOCR is very slow on CPU. Skip it only when Tesseract clearly filled the page.
+
+    Handwriting / sparse ink often yields few Tesseract words but lots of missing text — we still
+    run EasyOCR unless Tesseract is both long enough and has enough distinct words.
     """
     if os.environ.get("SMART_FIND_OCR_ALWAYS_EASYOCR", "").lower() in ("1", "true", "yes"):
         return False
     if os.environ.get("SMART_FIND_DISABLE_EASYOCR", "").lower() in ("1", "true", "yes"):
         return True
     try:
-        # Skip EasyOCR when Tesseract already returned enough text (major CPU save on uploads).
-        min_chars = int(os.environ.get("SMART_FIND_TESS_SUFFICIENT_CHARS", "110"))
+        min_chars = int(os.environ.get("SMART_FIND_TESS_SUFFICIENT_CHARS", "78"))
     except ValueError:
-        min_chars = 72
+        min_chars = 78
     if min_chars <= 0:
         return False
-    return _tesseract_text_score(tesseract_blocks) >= min_chars
+    score = _tesseract_text_score(tesseract_blocks)
+    wc = _tesseract_word_count(tesseract_blocks)
+    if score < 48:
+        return False
+    if wc < 10:
+        return False
+    return score >= min_chars
+
+
+def _maybe_boost_ocr_from_higher_dpi(
+    page: fitz.Page,
+    page_num: int,
+    dpi_use: int,
+    chosen: list[TextBlock],
+    hw_boost: bool,
+) -> list[TextBlock]:
+    """
+    If the first raster pass produced little text (common on faint scans / ink), retry once at
+    higher DPI. Keeps the better-yield result for search indexing.
+    """
+    if not chosen or dpi_use >= 218:
+        return chosen
+    sc = _tesseract_text_score(chosen)
+    if sc >= 48:
+        return chosen
+    dpi_hi = min(max(int(dpi_use * 1.28), dpi_use + 24), 228)
+    if dpi_hi <= dpi_use:
+        return chosen
+    try:
+        img, sx, sy = _raster_page_rgb(page, dpi_hi)
+        img = _ocr_image_preprocessing(img)
+        if hw_boost:
+            try:
+                from PIL import ImageEnhance
+
+                img = ImageEnhance.Contrast(img).enhance(1.12)
+            except Exception:
+                pass
+        te = _tesseract_blocks_from_image(img, page_num, sx, sy)
+        if hw_boost or not _skip_easyocr_after_tesseract(te):
+            ez = _easyocr_blocks_from_image(img, page_num, sx, sy, handwriting_boost=hw_boost)
+            alt = _pick_best_ocr_layer(te, ez)
+        else:
+            alt = te
+        if _tesseract_text_score(alt) > sc:
+            logger.debug(
+                "OCR retry at dpi=%s improved yield page=%s (%s -> %s chars)",
+                dpi_hi,
+                page_num,
+                sc,
+                _tesseract_text_score(alt),
+            )
+            return alt
+    except Exception as e:
+        logger.debug("High-DPI OCR retry skipped page %s: %s", page_num, e)
+    return chosen
 
 
 def _tesseract_ocr_config() -> str:
-    """PSM 6 = single uniform text block (typical notes/slides); override via SMART_FIND_TESSERACT_CONFIG."""
+    """
+    PSM 3 = fully automatic segmentation (forms, mixed layouts, insurance PDFs).
+    Override via SMART_FIND_TESSERACT_CONFIG (e.g. --oem 3 --psm 6 for uniform blocks).
+    """
     raw = (os.environ.get("SMART_FIND_TESSERACT_CONFIG") or "").strip()
     if raw:
         return raw
-    return "--oem 3 --psm 6"
+    return "--oem 3 --psm 3"
 
 
 def _tesseract_blocks_from_image(
@@ -366,9 +428,13 @@ def _tesseract_blocks_from_image(
     )
     blocks: list[TextBlock] = []
     n = len(data.get("text", []))
-    min_conf = 15
+    try:
+        min_conf = int(os.environ.get("SMART_FIND_TESS_MIN_CONF", "10"))
+    except ValueError:
+        min_conf = 10
+    min_conf = max(0, min(min_conf, 100))
     if os.environ.get("SMART_FIND_TESSERACT_STRICT", "").lower() in ("1", "true", "yes"):
-        min_conf = 30
+        min_conf = max(min_conf, 30)
 
     for i in range(n):
         word = (data["text"][i] or "").strip()
@@ -430,7 +496,7 @@ def _easyocr_blocks_from_image(
     for item in results:
         if not item or len(item) < 2:
             continue
-        box, text, conf = item[0], item[1], (item[2] if len(item) > 2 else 1.0)
+        box, text = item[0], item[1]
         t = (text or "").strip()
         if not t:
             continue
@@ -488,7 +554,7 @@ def extract_blocks_with_ocr_fallback(
     pdf_bytes: bytes,
     *,
     aggressive_ocr: bool = True,
-    ocr_dpi: int = 220,
+    ocr_dpi: int = 175,
     handwriting_merge: bool = False,
 ) -> list[TextBlock]:
     """
@@ -502,7 +568,8 @@ def extract_blocks_with_ocr_fallback(
         dpi_use = int(os.environ.get("SMART_FIND_OCR_DPI", str(ocr_dpi)))
     except ValueError:
         dpi_use = ocr_dpi
-    dpi_use = max(144, min(dpi_use, 400))
+    # 120–400: lower bound trades a little accuracy for faster raster + Tesseract (override via env).
+    dpi_use = max(120, min(dpi_use, 400))
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
@@ -510,7 +577,7 @@ def extract_blocks_with_ocr_fallback(
             page = doc[page_index]
             page_num = page_index + 1
             hw_boost = _ocr_boost_for_ink(handwriting_merge)
-            hw_mix = _merge_mixed_native_ocr(handwriting_merge)
+            hw_mix = _merge_mixed_native_ocr()
             native = extract_text_blocks_pymupdf_single_page(doc, page_index)
 
             if not aggressive_ocr:
@@ -556,6 +623,9 @@ def extract_blocks_with_ocr_fallback(
                         chosen = _pick_best_ocr_layer(te, ez)
                     else:
                         chosen = te
+                    chosen = _maybe_boost_ocr_from_higher_dpi(
+                        page, page_num, dpi_use, chosen, hw_boost
+                    )
                 if chosen:
                     all_blocks.extend(chosen)
                 elif native_clean:
@@ -569,7 +639,7 @@ def extract_blocks_with_ocr_fallback(
                 continue
 
             if native_clean:
-                if aggressive_ocr and hw_mix:
+                if hw_mix:
                     try:
                         img_m, sx_m, sy_m = _raster_page_rgb(page, dpi_use)
                         img_m = _ocr_image_preprocessing(img_m)
@@ -592,6 +662,9 @@ def extract_blocks_with_ocr_fallback(
                             chosen_m = _pick_best_ocr_layer(te_m, ez_m)
                         else:
                             chosen_m = te_m
+                        chosen_m = _maybe_boost_ocr_from_higher_dpi(
+                            page, page_num, dpi_use, chosen_m, hw_boost
+                        )
                         all_blocks.extend(
                             merge_ocr_with_native_blocks(chosen_m, native_clean)
                         )
@@ -626,11 +699,6 @@ def extract_text_blocks_pymupdf_single_page(doc: fitz.Document, page_index: int)
 
 _RX_STANDALONE_DATE = re.compile(
     r"^\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\s*$|^\s*\d{4}-\d{2}-\d{2}\s*$"
-)
-# Used only for fuzzy confidence hints (allows short digit runs inside longer lines).
-_RX_STANDALONE_ID = re.compile(
-    r"^\s*(?:[A-Z]{2,4}[-\s]?)?\d{5,12}\s*$|^\s*(?:SUB|POL)[-\s]?\d{4,12}\s*$",
-    re.I,
 )
 # Standalone *field* candidates: strict so OCR word boxes like "12345" do not flood the queue.
 _RX_STANDALONE_ID_FIELD = re.compile(
@@ -793,15 +861,6 @@ def _append_candidate(
             "detection": detection,
         }
     )
-
-
-def _union_bbox(a: tuple[float, ...], b: tuple[float, ...]) -> list[float]:
-    return [
-        min(a[0], b[0]),
-        min(a[1], b[1]),
-        max(a[2], b[2]),
-        max(a[3], b[3]),
-    ]
 
 
 def detect_fields_dynamic_from_blocks(blocks: list[TextBlock]) -> list[dict[str, Any]]:
@@ -1103,13 +1162,22 @@ def detect_fields_from_blocks(blocks: list[TextBlock]) -> list[dict[str, Any]]:
 
 def blocks_to_json(blocks: list[TextBlock]) -> list[dict[str, Any]]:
     """Serialize blocks as {text, bbox, page} for APIs / AI prompts."""
+    ordered = sorted(
+        blocks,
+        key=lambda b: (
+            int(b.page),
+            float(b.bbox[1]),
+            float(b.bbox[0]),
+            (b.text or "")[:96],
+        ),
+    )
     return [
         {
             "text": b.text,
             "bbox": [float(x) for x in b.bbox],
             "page": b.page,
         }
-        for b in blocks
+        for b in ordered
     ]
 
 
@@ -1123,7 +1191,8 @@ def process_pdf(
     Extract blocks and detected fields.
     If use_ocr_fallback is False, only PyMuPDF (faster; no tesseract required).
     aggressive_ocr: full-page OCR on low-text / watermark pages (scanned & handwritten forms).
-    handwriting_merge: merge full-page OCR with embedded text on mixed print+ink pages.
+    handwriting_merge: stronger OCR on weak pages / ink boost. Mixed native+full-page OCR per page is
+    controlled by SMART_FIND_MIXED_PAGE_OCR, not this flag.
     """
     if use_ocr_fallback:
         blocks = extract_blocks_with_ocr_fallback(

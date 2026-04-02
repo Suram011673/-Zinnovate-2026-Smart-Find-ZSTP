@@ -8,10 +8,10 @@ if not exist ".venv\Scripts\activate.bat" (
 )
 
 REM Default OCR tuning for scanned / handwritten PDFs (override in Environment Variables if needed)
-REM 200–240 is usually enough for Tesseract; higher DPI is much slower on large scans
-if not defined SMART_FIND_OCR_DPI set SMART_FIND_OCR_DPI=220
-REM Tesseract layout: PSM 6 = block of text (notes/slides). Try PSM 11 for sparse text: --oem 3 --psm 11
-if not defined SMART_FIND_TESSERACT_CONFIG set "SMART_FIND_TESSERACT_CONFIG=--oem 3 --psm 6"
+REM 160–200 is often enough; higher DPI is much slower on large scans
+if not defined SMART_FIND_OCR_DPI set SMART_FIND_OCR_DPI=175
+REM Tesseract: default in app is PSM 3 (auto layout). Override e.g. --oem 3 --psm 6 for uniform blocks
+if not defined SMART_FIND_TESSERACT_CONFIG set "SMART_FIND_TESSERACT_CONFIG="
 REM Optional: PIL preprocessing before OCR (prescriptions / noisy scans): 1=light contrast+sharpen, 2=strong
 REM set SMART_FIND_OCR_IMAGE_ENHANCE=1
 REM Optional: extra cursive handling on weak pages (slower)

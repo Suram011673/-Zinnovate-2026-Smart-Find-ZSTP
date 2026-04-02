@@ -157,6 +157,7 @@ export async function uploadPdf(file, options = {}) {
     use_gpt_validate = false,
     use_transformers = false,
     include_blocks = false,
+    defer_extraction = true,
   } = options;
   const fd = new FormData();
   fd.append('file', file);
@@ -169,8 +170,41 @@ export async function uploadPdf(file, options = {}) {
     use_gpt_validate: String(use_gpt_validate),
     use_transformers: String(use_transformers),
     include_blocks: String(include_blocks),
+    defer_extraction: String(defer_extraction),
   });
   return postMultipart(`/upload-pdf?${q}`, fd);
+}
+
+/**
+ * Full OCR + field extraction on PDFs already stored (after upload with defer_extraction).
+ * @param {object} options - same flags as upload (ocr, aggressive_ocr, …)
+ * @param {string[] | null} documentIds - omit or empty = all documents in session
+ */
+export async function extractDocuments(options = {}, documentIds = null) {
+  const {
+    ocr = true,
+    aggressive_ocr = true,
+    handwriting_merge = false,
+    dynamic_fields = true,
+    use_openai = false,
+    use_gpt_validate = false,
+    use_transformers = false,
+  } = options;
+  const q = new URLSearchParams({
+    ocr: String(ocr),
+    aggressive_ocr: String(aggressive_ocr),
+    handwriting_merge: String(handwriting_merge),
+    dynamic_fields: String(dynamic_fields),
+    use_openai: String(use_openai),
+    use_gpt_validate: String(use_gpt_validate),
+    use_transformers: String(use_transformers),
+  });
+  const body =
+    documentIds != null && Array.isArray(documentIds) && documentIds.length > 0
+      ? { document_ids: documentIds }
+      : {};
+  const { data } = await api.post(`/extract-documents?${q}`, body);
+  return data;
 }
 
 /** Upload multiple PDFs in one session. */
@@ -184,6 +218,7 @@ export async function uploadPdfBatch(fileList, options = {}, checksText = '', se
     use_gpt_validate = false,
     use_transformers = false,
     min_match_score = 62,
+    defer_extraction = true,
   } = options;
   const q = new URLSearchParams({
     ocr: String(ocr),
@@ -194,6 +229,7 @@ export async function uploadPdfBatch(fileList, options = {}, checksText = '', se
     use_gpt_validate: String(use_gpt_validate),
     use_transformers: String(use_transformers),
     min_match_score: String(min_match_score),
+    defer_extraction: String(defer_extraction),
   });
   const fd = new FormData();
   for (const f of fileList) {
