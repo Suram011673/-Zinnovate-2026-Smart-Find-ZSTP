@@ -2,61 +2,60 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 
 /**
  * Absolute-positioned highlight over a rendered PDF page canvas.
- * bbox: PDF points [x0,y0,x1,y1]; canvasW matches rendered canvas width for that page.
- * Search variant: scrolls the highlight into the PDF scroll parent (not the whole page card).
+ * bbox: PDF user space [x0,y0,x1,y1] (same as page.getViewport({ scale: 1 })).
+ * mapWidth/mapHeight: on-screen canvas size (getBoundingClientRect) — must match PDF→pixel mapping
+ * so highlights sit on the glyphs (not floating in empty margin).
  */
 export default function HighlightOverlay({
   pdf,
   pageNumber,
   bbox,
-  canvasW,
+  mapWidth,
+  mapHeight,
   needsReview,
   requiresVerification,
   variant = 'field',
-  /** When multiple search hits are shown, only the active match scrolls into view. */
   scrollIntoView: shouldScrollIntoView = true,
-  /** Stronger ring for the current Prev/Next match when multiple overlays are visible. */
   searchActive = false,
-  /**
-   * After Find, wait until the page canvas has painted before scrolling — avoids scrollbar/layout
-   * churn that cancels PDF.js render and leaves blank pages.
-   */
   deferScrollUntilPainted = false,
 }) {
   const [rect, setRect] = useState(null);
   const elRef = useRef(null);
 
   useEffect(() => {
-    if (!bbox || !pdf || !canvasW) {
+    if (!bbox || !pdf || !mapWidth || !mapHeight) {
       setRect(null);
       return;
     }
     let cancelled = false;
     pdf.getPage(pageNumber).then((page) => {
       const v1 = page.getViewport({ scale: 1 });
-      const scale = canvasW / v1.width;
+      let scaleX = mapWidth / v1.width;
+      let scaleY = mapHeight / v1.height;
+      /* Same aspect as page → one scale avoids 1px drift between X/Y from ResizeObserver. */
+      const arPdf = v1.width / v1.height;
+      const arMap = mapWidth / mapHeight;
+      if (Number.isFinite(arPdf) && arPdf > 0 && Math.abs(arMap - arPdf) / arPdf < 0.02) {
+        scaleX = scaleY = (scaleX + scaleY) / 2;
+      }
       const [x0, y0, x1, y1] = bbox;
       if (cancelled) return;
-      /* Search: no 2px floor — avoids a fat box around short tokens; field nav keeps a visible minimum. */
-      const minPx = variant === 'search' ? 0.35 : 2;
-      const w = Math.max((x1 - x0) * scale, minPx);
-      const h = Math.max((y1 - y0) * scale, minPx);
-      setRect({
-        left: x0 * scale,
-        top: y0 * scale,
-        width: w,
-        height: h,
-      });
+      const minW = variant === 'search' ? 1 : 2;
+      const minH = variant === 'search' ? 1.35 : 2;
+      const w = Math.max((x1 - x0) * scaleX, minW);
+      const h = Math.max((y1 - y0) * scaleY, minH);
+      const left = x0 * scaleX;
+      const top = y0 * scaleY;
+      setRect({ left, top, width: w, height: h });
     });
     return () => {
       cancelled = true;
     };
-  }, [bbox, canvasW, pdf, pageNumber, variant]);
+  }, [bbox, mapWidth, mapHeight, pdf, pageNumber, variant]);
 
-  /* block: 'nearest' avoids large scroll jumps that resize the viewer (scrollbar) and cancel PDF.js renders. */
   useLayoutEffect(() => {
     if (variant !== 'search' || !rect || !shouldScrollIntoView) return;
-    if (deferScrollUntilPainted && canvasW <= 0) return;
+    if (deferScrollUntilPainted && mapWidth <= 0) return;
 
     let cancelled = false;
     let t = null;
@@ -89,7 +88,7 @@ export default function HighlightOverlay({
       if (raf1 != null) cancelAnimationFrame(raf1);
       if (raf2 != null) cancelAnimationFrame(raf2);
     };
-  }, [variant, rect, bbox, shouldScrollIntoView, deferScrollUntilPainted, canvasW]);
+  }, [variant, rect, bbox, shouldScrollIntoView, deferScrollUntilPainted, mapWidth]);
 
   if (!rect) return null;
   const verify = variant === 'field' && (needsReview || requiresVerification);

@@ -65,6 +65,7 @@ const PdfPageCanvasCore = memo(
     const renderRetryRef = useRef(0);
     const [viewportSize, setViewportSize] = useState({ w: 0, h: 0 });
     const [canvasLayoutW, setCanvasLayoutW] = useState(0);
+    const [canvasLayoutH, setCanvasLayoutH] = useState(0);
     const [renderNonce, setRenderNonce] = useState(0);
 
     useEffect(() => {
@@ -142,19 +143,23 @@ const PdfPageCanvasCore = memo(
       const canvas = canvasRef.current;
       if (!canvas) return;
       const sync = () => {
-        const w = canvas.getBoundingClientRect().width;
-        if (w > 0) setCanvasLayoutW(w);
+        const r = canvas.getBoundingClientRect();
+        if (r.width > 0) setCanvasLayoutW(r.width);
+        if (r.height > 0) setCanvasLayoutH(r.height);
       };
       sync();
       const ro = new ResizeObserver(() => sync());
       ro.observe(canvas);
       return () => ro.disconnect();
-    }, [pdf, pageNumber, maxPageCssPx, renderNonce, viewportSize.w]);
+    }, [pdf, pageNumber, maxPageCssPx, renderNonce, viewportSize.w, viewportSize.h]);
 
     useEffect(() => {
-      const layoutW = canvasLayoutW > 0 ? canvasLayoutW : viewportSize.w;
-      onMetrics(viewportSize.w, layoutW);
-    }, [onMetrics, viewportSize.w, canvasLayoutW]);
+      const vw = viewportSize.w;
+      const vh = viewportSize.h;
+      const dw = canvasLayoutW > 0 ? canvasLayoutW : vw;
+      const dh = canvasLayoutH > 0 ? canvasLayoutH : vh;
+      onMetrics({ viewportW: vw, viewportH: vh, displayW: dw, displayH: dh });
+    }, [onMetrics, viewportSize.w, viewportSize.h, canvasLayoutW, canvasLayoutH]);
 
     return <canvas ref={canvasRef} />;
   },
@@ -166,17 +171,30 @@ const PdfPageCanvasCore = memo(
 
 function PageCanvasInner({ pdf, pageNumber, scrollTargetsRef, highlight, searchHits, maxPageCssPx }) {
   const wrapRef = useRef(null);
-  const [metrics, setMetrics] = useState({ canvasW: 0, layoutW: 0 });
-  const onMetrics = useCallback((canvasW, layoutW) => {
+  const [metrics, setMetrics] = useState({
+    viewportW: 0,
+    viewportH: 0,
+    displayW: 0,
+    displayH: 0,
+  });
+  const onMetrics = useCallback((m) => {
     setMetrics((prev) => {
-      if (prev.canvasW === canvasW && prev.layoutW === layoutW) return prev;
-      return { canvasW, layoutW };
+      if (
+        prev.viewportW === m.viewportW &&
+        prev.viewportH === m.viewportH &&
+        prev.displayW === m.displayW &&
+        prev.displayH === m.displayH
+      ) {
+        return prev;
+      }
+      return m;
     });
   }, []);
 
-  const highlightCanvasW =
-    metrics.layoutW > 0 ? metrics.layoutW : metrics.canvasW > 0 ? metrics.canvasW : 0;
-  const canvasPainted = metrics.canvasW > 0;
+  /** Map PDF user-space bbox → pixels using the same box the canvas uses on screen (fixes offset / floating highlights). */
+  const mapW = metrics.displayW > 0 ? metrics.displayW : metrics.viewportW;
+  const mapH = metrics.displayH > 0 ? metrics.displayH : metrics.viewportH;
+  const canvasPainted = metrics.viewportW > 0;
 
   return (
     <div
@@ -191,40 +209,44 @@ function PageCanvasInner({ pdf, pageNumber, scrollTargetsRef, highlight, searchH
     >
       <span className="pdf-page-label">Page {pageNumber}</span>
       <div className="pdf-page-inner">
-        <PdfPageCanvasCore
-          pdf={pdf}
-          pageNumber={pageNumber}
-          maxPageCssPx={maxPageCssPx}
-          onMetrics={onMetrics}
-        />
-        {highlight?.bbox && highlightCanvasW > 0 && (
-          <HighlightOverlay
-            bbox={highlight.bbox}
-            canvasW={highlightCanvasW}
+        <div className="pdf-page-canvas-stack">
+          <PdfPageCanvasCore
             pdf={pdf}
             pageNumber={pageNumber}
-            needsReview={highlight.needs_review}
-            requiresVerification={highlight.requires_verification}
-            variant={highlight.isSearch ? 'search' : 'field'}
+            maxPageCssPx={maxPageCssPx}
+            onMetrics={onMetrics}
           />
-        )}
-        {(searchHits || []).map((hit) =>
-          hit.bbox && highlightCanvasW > 0 ? (
+          {highlight?.bbox && mapW > 0 && mapH > 0 && (
             <HighlightOverlay
-              key={hit.overlayKey}
-              bbox={hit.bbox}
-              canvasW={highlightCanvasW}
+              bbox={highlight.bbox}
+              mapWidth={mapW}
+              mapHeight={mapH}
               pdf={pdf}
               pageNumber={pageNumber}
-              needsReview={false}
-              requiresVerification={false}
-              variant="search"
-              scrollIntoView={Boolean(hit.scrollIntoView)}
-              searchActive={Boolean(hit.scrollIntoView)}
-              deferScrollUntilPainted={canvasPainted}
+              needsReview={highlight.needs_review}
+              requiresVerification={highlight.requires_verification}
+              variant={highlight.isSearch ? 'search' : 'field'}
             />
-          ) : null,
-        )}
+          )}
+          {(searchHits || []).map((hit) =>
+            hit.bbox && mapW > 0 && mapH > 0 ? (
+              <HighlightOverlay
+                key={hit.overlayKey}
+                bbox={hit.bbox}
+                mapWidth={mapW}
+                mapHeight={mapH}
+                pdf={pdf}
+                pageNumber={pageNumber}
+                needsReview={false}
+                requiresVerification={false}
+                variant="search"
+                scrollIntoView={Boolean(hit.scrollIntoView)}
+                searchActive={Boolean(hit.scrollIntoView)}
+                deferScrollUntilPainted={canvasPainted}
+              />
+            ) : null,
+          )}
+        </div>
       </div>
     </div>
   );
@@ -373,7 +395,7 @@ const PDFViewer = forwardRef(function PDFViewer({ file, highlight, searchHits = 
   if (!file) {
     return (
       <div className="pdf-viewer pdf-viewer--empty" ref={containerRef}>
-        <p className="muted">Upload a PDF to preview.</p>
+        <p className="muted">Upload a file to preview.</p>
       </div>
     );
   }
@@ -389,7 +411,7 @@ const PDFViewer = forwardRef(function PDFViewer({ file, highlight, searchHits = 
   if (!pdf) {
     return (
       <div className="pdf-viewer pdf-viewer--empty" ref={containerRef}>
-        <p className="muted">Loading PDF…</p>
+        <p className="muted">Loading file…</p>
       </div>
     );
   }

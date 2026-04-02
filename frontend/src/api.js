@@ -82,11 +82,6 @@ async function postMultipart(path, formData, timeoutMs = 600_000) {
   }
 }
 
-export async function getFields() {
-  const { data } = await api.get('/fields');
-  return data;
-}
-
 /** OCR/native text blocks for the last uploaded PDF (for search on scans). */
 export async function getDocumentBlocks() {
   const { data } = await api.get('/document-blocks');
@@ -103,17 +98,6 @@ export async function documentSearch(query) {
 
 export async function getDocuments() {
   const { data } = await api.get('/documents');
-  return data;
-}
-
-/** Pre-ops gate: PDF review + optional required notification email. */
-export async function getSessionWorkflowStatus() {
-  const { data } = await api.get('/session/workflow-status');
-  return data;
-}
-
-export async function acknowledgeSessionReview() {
-  const { data } = await api.post('/session/acknowledge-review', {});
   return data;
 }
 
@@ -154,6 +138,12 @@ export async function completeField(fieldId) {
 
 export async function seedMock() {
   const { data } = await api.post('/seed-mock');
+  return data;
+}
+
+/** Drop current session on the server (documents, fields, search scope). */
+export async function resetSession() {
+  const { data } = await api.post('/reset');
   return data;
 }
 

@@ -20,34 +20,46 @@ function subStringBBox(item, startIdx, endIdx, viewport, opts = {}) {
   const m = pdfjsLib.Util.transform(viewport.transform, t);
   const wScale = Math.hypot(m[0], m[1]) || 1;
   const hScale = Math.hypot(m[2], m[3]) || wScale;
-  const totalW = item.width * wScale;
+  const ah = Math.abs(hScale);
+  const emSize = Math.max(Math.abs(wScale), ah, 1e-6);
+  /*
+   * item.width is often the horizontal advance for the whole TJ run; on many PDFs it does not match str.length.
+   * Uniform char fractions against a bad totalW shift highlights (e.g. "name" → "me"). Fall back to ~0.52 em/glyph.
+   */
+  const declaredW = Math.abs((item.width ?? 0) * wScale);
+  const perCharDecl = declaredW / n;
+  const lo = emSize * 0.22;
+  const hi = emSize * 1.28;
+  const totalW =
+    declaredW > 0 && perCharDecl >= lo && perCharDecl <= hi ? declaredW : emSize * 0.52 * n;
   const frac0 = Math.min(1, Math.max(0, startIdx / n));
   const frac1 = Math.min(1, Math.max(0, endIdx / n));
   const xL = m[4] + totalW * frac0;
   const xR = m[4] + totalW * frac1;
-  const yTop = m[5] - hScale;
-  const yBot = m[5];
+  /*
+   * PDF.js TextLayer uses baseline − fontHeight×ascentRatio (pdf.mjs #appendText), not full em above baseline.
+   */
+  const ascentRatio = tight ? 0.82 : 1;
+  const descentRatio = tight ? 0.2 : 0;
+  const yTop = tight ? m[5] - ah * ascentRatio : m[5] - hScale;
+  const yBot = tight ? m[5] + ah * descentRatio : m[5];
   let x0 = Math.min(xL, xR);
   let y0 = Math.min(yTop, yBot);
   let x1 = Math.max(xL, xR);
   let y1 = Math.max(yTop, yBot);
-  const ah = Math.abs(hScale);
   const spanLen = Math.max(0, endIdx - startIdx);
 
   /*
-   * Many PDFs set TextItem.width to the full line or column advance while str is only a short word
-   * (e.g. heading "Solution"). Uniform char-fraction then paints a highlight across the whole line.
-   * Clamp using typical em-width per glyph when the implied advance is implausible.
+   * Only clamp when the match covers (almost) the entire item. Partial-word clamp with implausiblyWideGlyph
+   * produced wrong left edges on forms (e.g. "name and" → box from "me…").
    */
   if (tight && spanLen >= 1 && spanLen <= 160) {
     const rawW = Math.abs(x1 - x0);
-    const em = ah || Math.abs(wScale) || 1;
+    const em = emSize;
     const estGlyphW = em * 0.58;
-    const capW = estGlyphW * spanLen * 1.1;
-    const impliedPerChar = rawW / spanLen;
-    const nearFullRun = spanLen >= n - 1;
-    const implausiblyWideGlyph = impliedPerChar > em * 0.88;
-    if (rawW > capW * 1.32 && (nearFullRun || implausiblyWideGlyph)) {
+    const capW = estGlyphW * spanLen * 1.12;
+    const nearFullRun = n > 1 ? spanLen >= n - 1 : true;
+    if (rawW > capW * 1.35 && nearFullRun) {
       const left = Math.min(x0, x1);
       const newW = Math.min(rawW, capW);
       x0 = left;
@@ -57,13 +69,13 @@ function subStringBBox(item, startIdx, endIdx, viewport, opts = {}) {
 
   /* Tight search: minimal floors so the box tracks the query, not extra line padding */
   const minW = tight ? Math.max(0.5, ah * 0.015) : Math.max(2, ah * 0.08);
-  const minH = tight ? Math.max(0.5, ah * 0.1) : Math.max(2, ah * 0.85);
+  const minH = tight ? Math.max(0.5, ah * 0.08) : Math.max(2, ah * 0.85);
   if (x1 - x0 < minW) {
     const mid = (x0 + x1) / 2;
     x0 = mid - minW / 2;
     x1 = mid + minW / 2;
   }
-  if (y1 - y0 < minH) {
+  if (!tight && y1 - y0 < minH) {
     const mid = (y0 + y1) / 2;
     y0 = mid - minH / 2;
     y1 = mid + minH / 2;
@@ -86,6 +98,31 @@ function unionBBox(boxes) {
   }
   if (!Number.isFinite(x0)) return [0, 0, 0, 0];
   return [x0, y0, x1, y1];
+}
+
+/** PDF viewport: y grows downward — smaller y is higher on the page. */
+export function compareBboxReadingOrder(ba, bb) {
+  if (!ba?.length || !bb?.length) return 0;
+  const ya = Math.min(ba[1], ba[3]);
+  const yb = Math.min(bb[1], bb[3]);
+  const xa = Math.min(ba[0], ba[2]);
+  const xb = Math.min(bb[0], bb[2]);
+  const LINE_TOL = 6;
+  if (Math.abs(ya - yb) > LINE_TOL) return ya - yb;
+  return xa - xb;
+}
+
+/**
+ * Sidebar document order → page ascending → top-to-bottom → left-to-right.
+ */
+export function compareSearchMatchReadingOrder(a, b, orderIdx = {}) {
+  const da = orderIdx[a.document_id] ?? 999;
+  const db = orderIdx[b.document_id] ?? 999;
+  if (da !== db) return da - db;
+  const pa = a.page ?? 0;
+  const pb = b.page ?? 0;
+  if (pa !== pb) return pa - pb;
+  return compareBboxReadingOrder(a.bbox, b.bbox);
 }
 
 /** Baseline Y and left X in viewport space for sorting / line grouping */
@@ -163,6 +200,33 @@ function maxLenDeltaForFuzzy(qLen) {
 }
 
 /**
+ * Merge PDF text items on one line into a string + span offsets. Inserts a single space between runs only
+ * when both sides are word characters and neither side already has whitespace (avoids "foo  bar" index drift).
+ */
+function mergeLineToSpans(line) {
+  let full = '';
+  const spans = [];
+  for (const { item } of line) {
+    const s = item.str || '';
+    if (!s) continue;
+    if (full.length) {
+      const last = full[full.length - 1];
+      const first = s[0];
+      const needGap =
+        isWordChar(last) &&
+        isWordChar(first) &&
+        !/\s/u.test(last) &&
+        !/\s/u.test(first);
+      if (needGap) full += ' ';
+    }
+    const start = full.length;
+    full += s;
+    spans.push({ item, start, end: full.length });
+  }
+  return { full, spans };
+}
+
+/**
  * Group text items into rough reading-order lines (same baseline band), merge text, search.
  */
 /** Merged-line search: full keyword/phrase with word boundaries only. */
@@ -200,15 +264,8 @@ function findInPageLinesBoundary(items, pageNum, viewport, qLower) {
   if (cur.length) lines.push(cur);
 
   for (const line of lines) {
-    let full = '';
-    const spans = [];
-    for (const { item } of line) {
-      const s = item.str || '';
-      if (full.length) full += ' ';
-      const start = full.length;
-      full += s;
-      spans.push({ item, start, end: full.length });
-    }
+    const { full, spans } = mergeLineToSpans(line);
+    if (!full.length) continue;
     const fullLow = full.toLowerCase();
 
     const recordMatch = (idx, len) => {
@@ -322,6 +379,7 @@ function dedupeEmbeddedHitsOnPage(hits) {
     if (out.some((k) => bboxSameEmbeddedHit(k.bbox, h.bbox))) continue;
     out.push(h);
   }
+  out.sort((a, b) => compareBboxReadingOrder(a.bbox, b.bbox));
   return out;
 }
 
@@ -402,15 +460,8 @@ function collectDigitFormattedLineMatches(items, pageNum, viewport, flexRe, seen
   if (cur.length) lines.push(cur);
 
   for (const line of lines) {
-    let full = '';
-    const spans = [];
-    for (const { item } of line) {
-      const s = item.str || '';
-      if (full.length) full += ' ';
-      const start = full.length;
-      full += s;
-      spans.push({ item, start, end: full.length });
-    }
+    const { full, spans } = mergeLineToSpans(line);
+    if (!full.length) continue;
     const re = new RegExp(flexRe.source, flexRe.flags);
     for (const m of full.matchAll(re)) {
       const absStart = m.index;
@@ -510,7 +561,7 @@ export async function findTextInPdf(pdf, rawQuery) {
   for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
     const page = await pdf.getPage(pageNum);
     const viewport = page.getViewport({ scale: 1 });
-    const { items } = await page.getTextContent({ normalizeWhitespace: true });
+    const { items } = await page.getTextContent();
 
     const pageHits = [];
     const pageSeen = new Set();

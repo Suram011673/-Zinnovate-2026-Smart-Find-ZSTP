@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import PDFViewer from './components/PDFViewer.jsx';
 import * as api from './api.js';
-import { findTextInMultiplePdfs } from './utils/pdfTextSearch.js';
+import { findTextInMultiplePdfs, compareSearchMatchReadingOrder } from './utils/pdfTextSearch.js';
+import brandMarkUrl from './assets/brand-mark.svg';
+import zinniaInsuranceLogo from './assets/zinniainsurance_logo.png';
 
 /** FastAPI: detail string, or Pydantic validation list, or fetch/axios network errors */
 function formatApiError(err) {
@@ -175,10 +177,7 @@ function mergeAndDedupeSearchMatches(localTagged, serverMatches, orderIdx, rawQu
     const db = orderIdx[b.document_id] ?? 999;
     if (da !== db) return da - db;
     if (a.page !== b.page) return a.page - b.page;
-    const aa = bboxArea(a);
-    const ba = bboxArea(b);
-    if (aa !== ba) return aa - ba;
-    return (a.bbox?.[1] || 0) - (b.bbox?.[1] || 0);
+    return compareSearchMatchReadingOrder(a, b, orderIdx);
   });
   const out = [];
   const qn = normSearchSnippet(rawQuery);
@@ -203,13 +202,14 @@ function mergeAndDedupeSearchMatches(localTagged, serverMatches, orderIdx, rawQu
     });
     if (!dup) out.push(m);
   }
+  /* Find / Prev / Next: always follow visual top → bottom (then left → right), not match-type or box size. */
+  out.sort((a, b) => compareSearchMatchReadingOrder(a, b, orderIdx));
   return out;
 }
 
 export default function App() {
   const pdfViewerRef = useRef(null);
   const [pdfFile, setPdfFile] = useState(null);
-  const [log, setLog] = useState([]);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState('');
   const [msgErr, setMsgErr] = useState(false);
@@ -224,12 +224,22 @@ export default function App() {
   const [documentsList, setDocumentsList] = useState([]);
   const [activeDocumentId, setActiveDocumentId] = useState(null);
   const [docFilesById, setDocFilesById] = useState({});
-  const [workflow, setWorkflow] = useState(null);
-  const [reviewConfirmChecked, setReviewConfirmChecked] = useState(false);
   /** Last Find: how many session PDFs contain the keyword vs how many were searched */
   const [searchPdfStats, setSearchPdfStats] = useState(null);
+  const [headerLogoIdx, setHeaderLogoIdx] = useState(0);
   const docFilesRef = useRef({});
   const activeDocRef = useRef(null);
+
+  const headerLogoSources = useMemo(
+    () => [
+      zinniaInsuranceLogo,
+      `${import.meta.env.BASE_URL}zinniainsurance_logo.png`,
+      `${import.meta.env.BASE_URL}zinniainsurance_logo.jpg`,
+      `${import.meta.env.BASE_URL}zinniainsurance_logo.svg`,
+      brandMarkUrl,
+    ],
+    [],
+  );
 
   /**
    * PDF overlays are 100% data-driven: each Find uses the current `searchText` and merged API + embedded
@@ -260,9 +270,6 @@ export default function App() {
       })
       .filter(Boolean);
   }, [searchMatches, activeDocumentId, searchIndex, searchText]);
-
-  /** Field navigation/search remain locked until review is acknowledged. */
-  const opsLocked = Boolean(workflow?.has_uploaded_pdfs && !workflow?.navigation_allowed);
 
   useEffect(() => {
     docFilesRef.current = docFilesById;
@@ -298,11 +305,6 @@ export default function App() {
     setMsgErr(true);
   };
 
-  const refreshFields = useCallback(async () => {
-    const data = await api.getFields();
-    setLog(data.navigation_log || []);
-  }, []);
-
   const refreshDocuments = useCallback(async () => {
     try {
       const data = await api.getDocuments();
@@ -311,11 +313,6 @@ export default function App() {
     } catch {
       setDocumentsList([]);
     }
-  }, []);
-
-  const refreshWorkflow = useCallback(async () => {
-    const w = await api.getSessionWorkflowStatus();
-    setWorkflow(w && typeof w === 'object' ? w : null);
   }, []);
 
   const clearSearchResults = useCallback(() => {
@@ -334,6 +331,22 @@ export default function App() {
     const files = picked?.length ? Array.from(picked) : [];
     e.target.value = '';
     if (!files.length) return;
+
+    /* New upload replaces the session: clear viewer + maps immediately, then server. */
+    clearSearchState();
+    setReadableDoc(null);
+    setDocFilesById({});
+    setDocumentsList([]);
+    setActiveDocumentId(null);
+    setPdfFile(null);
+    docFilesRef.current = {};
+    activeDocRef.current = null;
+    try {
+      await api.resetSession();
+    } catch {
+      /* Upload still replaces server session; ignore reset failure (e.g. API down). */
+    }
+
     setBusy(true);
     setUploading(true);
     setUploadingText(
@@ -343,9 +356,6 @@ export default function App() {
     );
     setMsg('');
     setMsgErr(false);
-    clearSearchState();
-    setReadableDoc(null);
-    setReviewConfirmChecked(false);
     try {
       setOk('Uploading…');
       const options = {
@@ -400,7 +410,6 @@ export default function App() {
       } else {
         setOk(`Ready: ${n} PDF(s) — viewing ${fn0}`);
       }
-      await refreshWorkflow();
     } catch (err) {
       setErr(formatApiError(err));
     } finally {
@@ -428,12 +437,11 @@ export default function App() {
           }
           setActiveDocumentId(m.document_id);
           setPdfFile(f);
-          await refreshFields();
           return;
         }
       }
     },
-    [refreshFields],
+    [],
   );
 
   const onSearchPdf = async () => {
@@ -457,7 +465,7 @@ export default function App() {
       });
     }
     if (!searchEntries.length) {
-      setErr('No PDF files loaded. Upload PDF(s) first.');
+      setErr('No files loaded. Upload File(s) first.');
       return;
     }
     setSearchBusy(true);
@@ -545,7 +553,6 @@ export default function App() {
       await api.setActiveDocument(documentId);
       setActiveDocumentId(documentId);
       setPdfFile(f);
-      await refreshFields();
       try {
         setReadableDoc(await api.getReadableText());
       } catch {
@@ -582,38 +589,46 @@ export default function App() {
     setMsgErr(false);
   };
 
-  const onAcknowledgeReview = async () => {
-    if (!reviewConfirmChecked) return;
-    setBusy(true);
-    setMsg('');
-    setMsgErr(false);
-    try {
-      const data = await api.acknowledgeSessionReview();
-      await refreshWorkflow();
-      if (data.navigation_allowed) {
-        setOk('Review acknowledged — Find and search are enabled.');
-      } else {
-        setOk(
-          data.navigation_blocked_reason ||
-            'Review saved. Complete the required step to unlock Find.',
-        );
-      }
-    } catch (e) {
-      setErr(formatApiError(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
   return (
     <div className="app">
       <header className="app-header">
-        <div className="app-header-brand">
-          <p className="app-header-eyebrow">Zinnia workflow</p>
-          <h1>Smart PDF Navigator</h1>
-          <p className="app-header-tagline">
-            Jump to each field on the PDF and search across files — less manual scrolling.
-          </p>
+        <div className="app-header-inner">
+          <div className="app-header-left">
+            <div className="app-header-logo-wrap">
+              <img
+                className="app-header-zinnia-logo"
+                src={headerLogoSources[headerLogoIdx]}
+                alt="Zinnia Insurance"
+                width={480}
+                height={75}
+                onError={() =>
+                  setHeaderLogoIdx((i) => Math.min(i + 1, headerLogoSources.length - 1))
+                }
+              />
+            </div>
+            <span className="app-header-rule" aria-hidden="true" />
+            <div className="app-header-product">
+              <h1 className="app-header-title">
+                <img
+                  src={brandMarkUrl}
+                  alt=""
+                  className="app-header-product-mark"
+                  width={29}
+                  height={29}
+                  decoding="async"
+                  aria-hidden="true"
+                />
+                <span className="app-header-title-text">Smart Find</span>
+              </h1>
+              <p className="app-header-product-hint">
+                Jump to each field on the image and search across files — zero manual scrolling.
+              </p>
+            </div>
+          </div>
+          <div className="app-header-badges" role="group" aria-label="Zinnia taglines">
+            <span className="app-header-chip">Rewiring Insurance With AI</span>
+            <span className="app-header-chip">Zinnia Simplifies Insurance</span>
+          </div>
         </div>
       </header>
 
@@ -623,7 +638,7 @@ export default function App() {
             <h2>Source</h2>
             <div className="btn-row btn-row--source">
               <label className="btn-primary file-pick file-pick--full">
-                Upload PDF(s)
+                Upload File(s)
                 <input
                   type="file"
                   accept=".pdf,application/pdf"
@@ -633,34 +648,6 @@ export default function App() {
                 />
               </label>
             </div>
-            <p className="muted small source-hint">Multi-select PDFs · large batches take longer.</p>
-            <details className="panel-tech-stack muted small">
-              <summary>Extraction pipeline (OCR &amp; NLP)</summary>
-              <ul className="tech-stack-list">
-                <li>
-                  <strong>Computer vision</strong> — Each scanned page is rasterized; optional server env{' '}
-                  <code>SMART_FIND_OCR_IMAGE_ENHANCE</code> (1=light, 2=strong) applies contrast and sharpening before
-                  OCR, similar to prescription image cleanup.
-                </li>
-                <li>
-                  <strong>OCR</strong> — <strong>Tesseract</strong> (open source) reads words from pixels;{' '}
-                  <strong>EasyOCR</strong> (deep learning) improves lines and handwriting when enabled.
-                </li>
-                <li>
-                  <strong>Handwriting</strong> — Server <code>SMART_FIND_HANDWRITING_MODE=1</code> enables stronger OCR for
-                  harder cursive (slower).
-                </li>
-                <li>
-                  <strong>NLP / structuring</strong> — Detected fields come from layout + text; optional <strong>OpenAI</strong>{' '}
-                  can further interpret labels and values. Domain-specific medical models can be added server-side the same
-                  way.
-                </li>
-              </ul>
-              <p className="tech-stack-foot muted small">
-                Google Cloud Vision / Azure OCR are not bundled; you can plug them into the API and feed the same block
-                format if needed.
-              </p>
-            </details>
             {documentsList.length > 0 && (
               <p className="muted small" style={{ marginTop: 6, marginBottom: 0 }}>
                 <strong>{documentsList.length}</strong> PDF{documentsList.length === 1 ? '' : 's'} in this session
@@ -686,76 +673,18 @@ export default function App() {
             )}
           </section>
 
-          {workflow?.has_uploaded_pdfs && (
-            <section className="panel panel--preops">
-              <h2>Before field operations</h2>
-              {workflow.navigation_allowed ? (
-                <p className="preops-unlocked">
-                  <span className="preops-unlocked__icon" aria-hidden="true">
-                    ✓
-                  </span>
-                  <span className="preops-unlocked__text">
-                    Ready — use <strong>Find</strong> and the document viewer.
-                  </span>
-                </p>
-              ) : (
-                <>
-                  <p className="preops-lead">
-                    Review every uploaded PDF in the viewer, then confirm below. Find stays locked until you
-                    complete this step.
-                  </p>
-                  <div className="preops-track" aria-hidden="true">
-                    <span
-                      className={
-                        reviewConfirmChecked
-                          ? 'preops-track__pill preops-track__pill--done'
-                          : 'preops-track__pill preops-track__pill--pending'
-                      }
-                    >
-                      Review confirmed
-                    </span>
-                    <span className="preops-track__arrow">→</span>
-                    <span className="preops-track__pill preops-track__pill--pending">Unlock</span>
-                  </div>
-
-                  <div className="preops-divider" />
-
-                  <label className="preops-checkbox">
-                    <input
-                      type="checkbox"
-                      checked={reviewConfirmChecked}
-                      disabled={busy}
-                      onChange={(e) => setReviewConfirmChecked(e.target.checked)}
-                    />
-                    <span>I have reviewed all uploaded PDF(s) in the viewer.</span>
-                  </label>
-                  <button
-                    type="button"
-                    className="btn-primary btn-full preops-continue-btn"
-                    disabled={busy || !reviewConfirmChecked}
-                    onClick={() => void onAcknowledgeReview()}
-                  >
-                    Continue to Find
-                  </button>
-                </>
-              )}
-            </section>
-          )}
-
           <section className="panel panel--search">
             <h2>Search</h2>
             <p className="field-hint muted small">
-              Type any word, number, or phrase — Find runs on that text only. All hits on the open PDF highlight
-              together; Prev/Next moves focus (accent + scroll).
+              Type any word, number, or phrase — Find runs on that text only. All hits on the open Document
+              highlight together; Prev/Next moves focus (accent + scroll).
             </p>
             <input
               type="text"
               className="search-input"
               placeholder="Search words, numbers, or phrases…"
               value={searchText}
-              disabled={
-                opsLocked || searchBusy || (!documentsList.length && !pdfFile)
-              }
+              disabled={searchBusy || (!documentsList.length && !pdfFile)}
               onChange={(e) => setSearchText(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') onSearchPdf();
@@ -767,10 +696,7 @@ export default function App() {
                 type="button"
                 className="btn-primary"
                 disabled={
-                  opsLocked ||
-                  searchBusy ||
-                  !searchText.trim() ||
-                  (!documentsList.length && !pdfFile)
+                  searchBusy || !searchText.trim() || (!documentsList.length && !pdfFile)
                 }
                 onClick={onSearchPdf}
               >
@@ -779,7 +705,7 @@ export default function App() {
               <button
                 type="button"
                 className="btn-secondary"
-                disabled={opsLocked || !searchMatches.length}
+                disabled={!searchMatches.length}
                 onClick={onSearchPrev}
               >
                 Prev
@@ -787,7 +713,7 @@ export default function App() {
               <button
                 type="button"
                 className="btn-secondary"
-                disabled={opsLocked || !searchMatches.length}
+                disabled={!searchMatches.length}
                 onClick={onSearchNext}
               >
                 Next
@@ -795,7 +721,7 @@ export default function App() {
               <button
                 type="button"
                 className="btn-secondary"
-                disabled={opsLocked || !searchMatches.length}
+                disabled={!searchMatches.length}
                 onClick={onClearSearch}
               >
                 Clear
@@ -833,11 +759,6 @@ export default function App() {
                 {msg}
               </p>
             ) : null}
-
-            <details className="panel panel--log panel--collapsible">
-              <summary>Activity log</summary>
-              <pre className="nav-log">{log.length ? log.slice(-12).join('\n') : 'No navigation events yet.'}</pre>
-            </details>
           </div>
         </aside>
 
@@ -851,7 +772,7 @@ export default function App() {
                 </span>
               ) : (
                 <span className="app-doc-frame__filename app-doc-frame__filename--placeholder">
-                  Upload a PDF to open the transaction document
+                  Upload a file to open the transaction document
                 </span>
               )}
             </div>
@@ -863,13 +784,6 @@ export default function App() {
                   <p className="pdf-upload-loader__text">
                     {uploadingText || 'This can take longer for scanned or handwritten files.'}
                   </p>
-                </div>
-              )}
-              {opsLocked && (
-                <div className="pdf-mandatory-banner" role="status">
-                  <strong>Document review is mandatory</strong> — View the PDF(s) below, complete{' '}
-                  <strong>Before field operations</strong> in the sidebar, then confirm you have reviewed. Find
-                  stays locked until then.
                 </div>
               )}
               <PDFViewer
